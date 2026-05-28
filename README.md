@@ -65,4 +65,4 @@ This will install `vwipe` to `/usr/local/bin` and add a desktop entry with the o
 On **Copy-on-Write (CoW)** filesystems like Btrfs, ZFS, or APFS, individual file wiping may be bypassed by the filesystem controller. In these cases, **Free Space Sanitization** is the recommended method to ensure data destruction.
 
 ## 📄 License
-Copyright © 2026 Jean-Francois Lachance-Caumartin. All rights reserved.
+Copyright © 2026 Jean-François Lachance-Caumartin. Licensed under the MIT License.

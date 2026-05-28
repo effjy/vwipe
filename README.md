@@ -1,5 +1,11 @@
 # Virtual Wipe Turbo v2.5.5
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Standard](https://img.shields.io/badge/standard-NIST%20SP%20800--88-blue)]()
+[![RAM](https://img.shields.io/badge/RAM-Sanitizer-brightgreen)]()
+[![Threads](https://img.shields.io/badge/threads-8--core-orange)]()
+[![Krakken](https://img.shields.io/badge/Powered%20by-Krakken--2048-00FFCC)](https://github.com/effjy/krakken)
+
 **Virtual Wipe Turbo** is a state-of-the-art secure data sanitization tool designed for high-performance forensic-grade wiping. Engineered to leverage modern multi-core processors, it utilizes a parallel "Turbo Engine" to saturate NVMe throughput, ensuring the fastest possible sanitization while maintaining strict compliance with international security standards.
 
 ## 🚀 Key Features
@@ -63,6 +69,13 @@ This will install `vwipe` to `/usr/local/bin` and add a desktop entry with the o
 
 ## ⚖️ Forensic Note
 On **Copy-on-Write (CoW)** filesystems like Btrfs, ZFS, or APFS, individual file wiping may be bypassed by the filesystem controller. In these cases, **Free Space Sanitization** is the recommended method to ensure data destruction.
+
+## 🔗 Related Projects
+
+- **[Krakken-2048 Abyssal](https://github.com/effjy/krakken)** – The 2048‑bit SPN‑ARX hybrid cryptographic permutation.
+- **[Krakken-Disk](https://github.com/effjy/krakken-disk)** – Post‑quantum encrypted disk manager using the Krakken permutation.
+
+*These projects are part of the Krakken cryptographic ecosystem.*
 
 ## 📄 License
 Copyright © 2026 Jean-François Lachance-Caumartin. Licensed under the MIT License.

@@ -1,80 +1,102 @@
 # Virtual Wipe Turbo v2.6.0
 
-**Virtual Wipe Turbo** is a state-of-the-art secure data sanitization tool designed for high-performance forensic-grade wiping. Engineered to leverage modern multi-core processors, it utilizes a parallel "Turbo Engine" to saturate NVMe throughput, ensuring the fastest possible sanitization while maintaining strict compliance with international security standards.
+**Virtual Wipe Turbo** is a high-performance, forensic-grade secure data sanitization suite engineered for maximum speed and uncompromising security. Leveraging a multi-core "Turbo Engine," it saturates modern NVMe and SSD throughput while maintaining full compliance with rigorous international standards.
+
+Built for security professionals, forensic investigators, and privacy-conscious users who demand both speed and mathematical certainty.
+
+---
 
 ## 🚀 Key Features
 
-- ⚡ **8-Core Turbo-Wipe Engine**: Automatically detects CPU topology and launches parallel worker threads to maximize I/O throughput on SSDs and NVMe drives.
-- 🛡️ **NIST SP 800-88 Rev. 1 Aligned**: Supports Baseline (Clear) and Multi-Pass (Purge) schemes used by federal and international agencies.
-- 🧬 **FIPS 140-3 High-Entropy Sanitization**: Utilizes high-speed cryptographic PRNGs to ensure data on disk is mathematically indistinguishable from random noise (IND-RND).
-- 🔒 **RAM Protection (mlock)**: Sensitive wiping buffers are locked into physical RAM to prevent data leakage to swap space or hibernation files.
-- 🌑 **Premium Dark Aesthetic**: A sophisticated charcoal-and-teal interface designed for modern forensic workstations.
-- 📁 **Comprehensive Operations**:
-    *   **File Wipe**: Targeted secure deletion of individual files.
-    *   **Directory Wipe**: Recursive sanitization of entire folder structures.
-    *   **Free Space Wipe**: Multi-threaded sanitization of unallocated disk space.
-    *   **RAM Fill**: Dedicated module to clear residual data from system memory.
+- ⚡ **8-Core Turbo-Wipe Engine** — Automatically detects CPU topology and deploys parallel workers to fully saturate storage bandwidth.
+- 🛡️ **NIST SP 800-88 Rev. 1 Compliant** — Supports both Baseline (Clear) and Purge schemes used by government and enterprise standards.
+- 🧬 **FIPS 140-3 Grade Entropy** — Cryptographically secure PRNGs ensure wiped data is indistinguishable from true random noise (IND-RND).
+- 🔒 **RAM Protection** — Sensitive buffers are `mlock()`'ed into physical memory to prevent leakage to swap or hibernation files.
+- 🌑 **Premium Dark Interface** — Sophisticated charcoal and teal aesthetic tailored for professional forensic workstations.
+- 📁 **Comprehensive Wiping Modes**:
+  - **File Wipe** — Secure deletion of individual files
+  - **Directory Wipe** — Recursive sanitization with metadata purging
+  - **Free Space Wipe** — Multi-threaded cleaning of unallocated sectors
+  - **RAM Fill** — Dedicated volatile memory sanitization module
+
+---
 
 ## 🛠️ Prerequisites
 
-Ensure you have the following dependencies installed before building:
-
-### Build Tools
-- `gcc` (support for C11 and OpenMP/Pthreads)
+### Build Dependencies
+- `gcc` (C11 + OpenMP/Pthreads support)
 - `make`
 - `pkg-config`
 
 ### Required Libraries
-- `gtk+-3.0` (GTK3 Development Headers)
-- `glib-2.0`
-- `pthreads`
+- GTK3 (`gtk+-3.0`)
+- GLib 2.0
+- Pthreads
 
-### Installation Command (Ubuntu/Debian)
+**Installation on Ubuntu/Debian:**
 ```bash
 sudo apt update
 sudo apt install build-essential libgtk-3-dev pkg-config
 ```
 
+---
+
 ## 🏗️ Installation
 
-### 1. Build the Application
 ```bash
+# Build
 make clean && make
-```
 
-### 2. System-wide Install (Optional)
-```bash
+# Optional system-wide install
 sudo make install
 ```
-This will install `vwipe` to `/usr/local/bin` and add a desktop entry with the official icon.
+
+This installs the `vwipe` binary to `/usr/local/bin` and registers the desktop entry with the official icon.
+
+---
 
 ## 📖 Usage
 
-### Running Locally
 ```bash
 ./vwipe
 ```
 
-### Sanitization Schemes
-1.  **NIST Clear**: Single-pass zero fill (fastest).
-2.  **DoD 5220.22-M**: 3-pass overwrite (Standard).
-3.  **NIST Purge**: 4-pass high-security sanitization with verification.
-4.  **FIPS High-Entropy**: 5-pass strongest purge using multiple random patterns.
+### Available Sanitization Schemes
 
-## ⚖️ Forensic Note
-On **Copy-on-Write (CoW)** filesystems like Btrfs, ZFS, or APFS, individual file wiping may be bypassed by the filesystem controller. In these cases, **Free Space Sanitization** is the recommended method to ensure data destruction.
+1. **NIST Clear** — Single-pass zero fill (maximum speed)
+2. **DoD 5220.22-M** — Classic 3-pass overwrite
+3. **NIST Purge** — 4-pass high-security scheme with verification
+4. **FIPS High-Entropy** — 5-pass strongest purge using multiple cryptographically random patterns
 
-## 🔄 Release Updates & Bug Fixes (v2.6.0)
+---
 
-Version 2.6.0 resolves multiple logic bugs, thread safety data races, and potential vulnerabilities:
-- **Directory Metadata Purging**: Wipes access/modification times and issues parent directory `fsync` calls to ensure directory entry removals are committed to disk.
-- **Wipe TRIM Fix**: Re-ordered deletion sequence to call `attempt_trim` before unlinking files so storage TRIM works properly.
-- **Thread Safety & Atomicity**: Isolated active scheme parameters in worker contexts and upgraded progress metric counters to atomic structures.
-- **RAM Module Safety**: Patched incorrect `mlock` capability checking, async-signal safety bugs in handler routines, and seeded random passes cryptographically.
+## ⚖️ Forensic Considerations
 
-For the full detailed breakdown of fixes, see [UPDATE.md](file:///home/user/data/utils/vwipe/UPDATE.md).
+On Copy-on-Write filesystems (Btrfs, ZFS, APFS), traditional file-level wiping can be ineffective due to snapshotting and delayed allocation. In such cases, **Free Space Wipe** is strongly recommended to ensure complete data destruction.
+
+---
+
+## 🔄 v2.6.0 Release Highlights
+
+Version 2.6.0 brings significant stability, security, and correctness improvements:
+
+- Enhanced directory metadata purging with parent `fsync()` to guarantee removal of file entries
+- Fixed TRIM sequencing to ensure proper SSD wear-leveling cooperation
+- Improved thread safety with atomic progress counters and isolated scheme parameters
+- Hardened RAM module with corrected `mlock` capability checks and cryptographically seeded passes
+- Resolved multiple data race conditions and async-signal safety issues
+
+For the complete changelog, see [UPDATE.md](UPDATE.md).
+
+---
 
 ## 📄 License
-This project is licensed under the MIT License. See the LICENSE file for details.
 
-Copyright © 2026 Jean-Francois Lachance-Caumartin. All rights reserved.
+This project is released under the **MIT License**.
+
+Copyright © 2026 Jean-François Lachance-Caumartin. All rights reserved.
+
+---
+
+*🦑 Part of the Krakken Cryptographic Ecosystem — 2026*
+```

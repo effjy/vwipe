@@ -63,7 +63,7 @@ typedef struct {
 /* Global state variables */
 atomic_bool g_stop_flag = false;
 atomic_size_t g_bytes_written = 0;
-volatile size_t g_target_bytes = 0;
+atomic_size_t g_target_bytes = 0;
 volatile time_t g_start_time = 0;
 struct termios g_original_termios;
 int g_termios_saved = 0;
@@ -296,9 +296,9 @@ int check_for_stop_interrupt(void);
 void update_progress(const char *label);
 void startup_compliance_check(void);
 void launch_ram_fill(unsigned long safety_mb);
-int wipe_file(const char *path);
-int wipe_directory_recursive(const char *path);
-int wipe_free_space(const char *path, int num_cores);
+int wipe_file(const char *path, const WipeScheme *scheme);
+int wipe_directory_recursive(const char *path, const WipeScheme *scheme);
+int wipe_free_space(const char *path, int num_cores, const WipeScheme *scheme);
 
 /* GTK callback prototypes */
 void on_file_wipe_clicked(GtkButton *button, gpointer user_data);
@@ -481,9 +481,10 @@ void update_progress(const char *label) {
     
     /* Throttle updates to ~10 per second (100ms) to prevent UI flooding, 
        but always allow the final 100% update */
-    if (g_target_bytes > 0) {
+    size_t target_val = atomic_load(&g_target_bytes);
+    if (target_val > 0) {
         size_t written = atomic_load(&g_bytes_written);
-        double fraction = (double)written / (double)g_target_bytes;
+        double fraction = (double)written / (double)target_val;
         if (fraction > 1.0) fraction = 1.0;
         
         pthread_mutex_lock(&g_progress_mutex);
@@ -502,7 +503,7 @@ void update_progress(const char *label) {
             update->fraction = fraction;
             snprintf(update->status, sizeof(update->status), "%s: %.1f%% (%.2f MB/%.2f MB) - %.2f MB/s",
                      label, fraction * 100.0,
-                     written / 1048576.0, g_target_bytes / 1048576.0, speed_mb);
+                     written / 1048576.0, target_val / 1048576.0, speed_mb);
             g_idle_add(idle_update_status, update);
         }
     }
@@ -591,7 +592,7 @@ void launch_ram_fill(unsigned long safety_mb) {
 }
 
 /* Wipe file implementation */
-int wipe_file(const char *path) {
+int wipe_file(const char *path, const WipeScheme *scheme) {
     g_stop_flag = false;
     struct stat st;
     int fd = -1;
@@ -623,7 +624,7 @@ int wipe_file(const char *path) {
     }
 
     size_t file_size = (size_t)st.st_size;
-    g_target_bytes = file_size * schemes[current_scheme_idx].pass_count;
+    atomic_store(&g_target_bytes, file_size * scheme->pass_count);
     g_bytes_written = 0;
     g_start_time = time(NULL);
     
@@ -676,8 +677,8 @@ int wipe_file(const char *path) {
     uint64_t file_seed = 0;
     get_secure_random(&file_seed, sizeof(file_seed));
 
-    for (int p = 0; p < schemes[current_scheme_idx].pass_count && !g_stop_flag; p++) {
-        PassType type = schemes[current_scheme_idx].passes[p];
+    for (int p = 0; p < scheme->pass_count && !g_stop_flag; p++) {
+        PassType type = scheme->passes[p];
         size_t offset = 0;
         
         while (offset < file_size && !g_stop_flag) {
@@ -689,7 +690,7 @@ int wipe_file(const char *path) {
             if (type == PASS_VERIFY) {
                 /* Verify against the pattern of the PREVIOUS pass (p-1) */
                 if (p > 0) {
-                    PassType prev_type = schemes[current_scheme_idx].passes[p-1];
+                    PassType prev_type = scheme->passes[p-1];
                     uint64_t prev_chunk_seed = file_seed ^ (uint64_t)offset ^ (uint64_t)(p-1);
                     
                     /* Re-generate the expected pattern into vbuf */
@@ -780,8 +781,12 @@ cleanup:
             if (rename(path, new_name) == 0) {
                 int dfd = open(dir, O_RDONLY);
                 if (dfd >= 0) { fsync(dfd); close(dfd); }
-                if (unlink(new_name) == 0) attempt_trim(path);
-            } else { unlink(path); }
+                attempt_trim(new_name);
+                unlink(new_name);
+            } else {
+                attempt_trim(path);
+                unlink(path);
+            }
             free(dir);
         }
         snprintf(msg, sizeof(msg), "File securely sanitized & removed: %s", path);
@@ -816,7 +821,7 @@ uint64_t calculate_dir_size(const char *path) {
 }
 
 /* Recursively wipe directory */
-int wipe_directory_recursive(const char *path) {
+int wipe_directory_recursive(const char *path, const WipeScheme *scheme) {
     DIR *dir = opendir(path);
     if (!dir) {
         log_message("Error: Cannot open directory");
@@ -830,16 +835,25 @@ int wipe_directory_recursive(const char *path) {
         struct stat st;
         if (lstat(fullpath, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
-            wipe_directory_recursive(fullpath);
+            wipe_directory_recursive(fullpath, scheme);
             char new_dir_name[4096];
             snprintf(new_dir_name, sizeof(new_dir_name), "%s/.sec_wipe_dir_%lu_%lu", path, (unsigned long)time(NULL), (unsigned long)getpid());
+            struct timespec times[2] = {{0, 0}, {0, 0}};
             if (rename(fullpath, new_dir_name) == 0) {
+                utimensat(AT_FDCWD, new_dir_name, times, AT_SYMLINK_NOFOLLOW);
                 rmdir(new_dir_name);
             } else {
+                utimensat(AT_FDCWD, fullpath, times, AT_SYMLINK_NOFOLLOW);
                 rmdir(fullpath);
             }
+            /* fsync parent directory to flush directory entry removal */
+            int pfd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (pfd >= 0) {
+                fsync(pfd);
+                close(pfd);
+            }
         } else if (S_ISREG(st.st_mode)) {
-            wipe_file(fullpath);
+            wipe_file(fullpath, scheme);
         }
     }
     closedir(dir);
@@ -851,6 +865,7 @@ typedef struct {
     char path[4096];
     int thread_id;
     uint64_t target_per_thread;
+    WipeScheme scheme;
 } FreeSpaceWorkerData;
 
 void *free_space_worker(void *data) {
@@ -866,13 +881,13 @@ void *free_space_worker(void *data) {
     
     if (g_mlock_supported) mlock(buf, BUFFER_SIZE);
 
-    while (atomic_load(&g_bytes_written) < g_target_bytes && !g_stop_flag) {
+    while (atomic_load(&g_bytes_written) < atomic_load(&g_target_bytes) && !g_stop_flag) {
         char *tmpname = strdup(tmp_template);
         int fd = mkstemp(tmpname);
         if (fd < 0) {
             free(tmpname);
             if (errno == ENOSPC) {
-                g_target_bytes = atomic_load(&g_bytes_written);
+                atomic_store(&g_target_bytes, atomic_load(&g_bytes_written));
             } else {
                 g_stop_flag = true;
             }
@@ -886,19 +901,20 @@ void *free_space_worker(void *data) {
         size_t chunk = BUFFER_SIZE * 128; /* 512MB files for parallel efficiency */
         size_t off = 0;
         
-        for (int p = 0; p < schemes[current_scheme_idx].pass_count && !g_stop_flag; p++) {
+        for (int p = 0; p < wd->scheme.pass_count && !g_stop_flag; p++) {
             /* Unique seed per thread/pass/file */
             uint64_t seed = (uint64_t)time(NULL) ^ (uintptr_t)buf ^ (uint64_t)wd->thread_id ^ (uint64_t)tmp_count;
-            fill_buffer(buf, BUFFER_SIZE, schemes[current_scheme_idx].passes[p], seed);
+            fill_buffer(buf, BUFFER_SIZE, wd->scheme.passes[p], seed);
             
             lseek(fd, 0, SEEK_SET);
             off = 0;
-            while (off < chunk && !g_stop_flag && (p > 0 || atomic_load(&g_bytes_written) < g_target_bytes)) {
+            while (off < chunk && !g_stop_flag && (p > 0 || atomic_load(&g_bytes_written) < atomic_load(&g_target_bytes))) {
                 size_t tw = (chunk - off > BUFFER_SIZE) ? BUFFER_SIZE : (chunk - off);
                 /* Final check to not exceed target (only in pass 0) */
                 if (p == 0) {
                     size_t current_total = atomic_load(&g_bytes_written);
-                    if (current_total + tw > g_target_bytes) tw = g_target_bytes - current_total;
+                    size_t target_val = atomic_load(&g_target_bytes);
+                    if (current_total + tw > target_val) tw = target_val - current_total;
                 }
                 if (tw == 0) {
                     if (ftruncate(fd, (off_t)off) == 0) {}
@@ -911,7 +927,7 @@ void *free_space_worker(void *data) {
                     if (errno == ENOSPC) {
                         if (ftruncate(fd, (off_t)off) == 0) {}
                         chunk = off;
-                        g_target_bytes = atomic_load(&g_bytes_written);
+                        atomic_store(&g_target_bytes, atomic_load(&g_bytes_written));
                     } else {
                         g_stop_flag = true;
                     }
@@ -946,7 +962,7 @@ void *free_space_worker(void *data) {
     return NULL;
 }
 
-int wipe_free_space(const char *path, int num_cores) {
+int wipe_free_space(const char *path, int num_cores, const WipeScheme *scheme) {
     g_stop_flag = false;
     struct statvfs st;
     if (statvfs(path, &st) != 0) {
@@ -959,7 +975,7 @@ int wipe_free_space(const char *path, int num_cores) {
         return -1;
     }
 
-    g_target_bytes = (size_t)avail * schemes[current_scheme_idx].pass_count;
+    atomic_store(&g_target_bytes, (size_t)avail * scheme->pass_count);
     atomic_store(&g_bytes_written, 0); 
     g_start_time = time(NULL);
     
@@ -973,15 +989,27 @@ int wipe_free_space(const char *path, int num_cores) {
     log_message(msg);
 
     pthread_t threads[16];
+    int created_threads = 0;
     for (int i = 0; i < num_cores; i++) {
         FreeSpaceWorkerData *wd = malloc(sizeof(FreeSpaceWorkerData));
+        if (!wd) {
+            log_message("Error: Failed to allocate memory for free space worker");
+            break;
+        }
         strncpy(wd->path, path, 4095);
         wd->thread_id = i;
         wd->target_per_thread = avail / num_cores;
-        pthread_create(&threads[i], NULL, free_space_worker, wd);
+        wd->scheme = *scheme;
+        int rc = pthread_create(&threads[i], NULL, free_space_worker, wd);
+        if (rc != 0) {
+            log_message("Error: Failed to create free space worker thread");
+            free(wd);
+            break;
+        }
+        created_threads++;
     }
 
-    for (int i = 0; i < num_cores; i++) {
+    for (int i = 0; i < created_threads; i++) {
         pthread_join(threads[i], NULL);
     }
 
@@ -1074,11 +1102,12 @@ void add_css_class(GtkWidget *widget, const char *class_name) {
 typedef struct {
     char *path;
     int thread_count;
+    WipeScheme scheme;
 } ThreadData;
 
 void *thread_wipe_file(void *data) {
     ThreadData *td = (ThreadData *)data;
-    wipe_file(td->path);
+    wipe_file(td->path, &td->scheme);
     free(td->path);
     free(td);
     g_idle_add(idle_reset_ui, NULL);
@@ -1090,14 +1119,14 @@ void *thread_wipe_dir(void *data) {
     g_start_time = time(NULL);
     log_message("Pre-scanning directory for size estimation...");
     uint64_t total_size = calculate_dir_size(td->path);
-    g_target_bytes = (size_t)total_size * schemes[current_scheme_idx].pass_count;
+    atomic_store(&g_target_bytes, (size_t)total_size * td->scheme.pass_count);
     g_bytes_written = 0;
     
     char msg[512];
     snprintf(msg, sizeof(msg), "Recursively sanitizing directory (Total: %.2f MB)...", total_size / 1048576.0);
     log_message(msg);
     
-    wipe_directory_recursive(td->path);
+    wipe_directory_recursive(td->path, &td->scheme);
     
     char new_dir_name[4096];
     char *parent = strdup(td->path);
@@ -1105,12 +1134,23 @@ void *thread_wipe_dir(void *data) {
     if (last_slash) {
         *last_slash = '\0';
         snprintf(new_dir_name, sizeof(new_dir_name), "%s/.sec_wipe_dir_%lu", parent, (unsigned long)time(NULL));
+        struct timespec times[2] = {{0, 0}, {0, 0}};
         if (rename(td->path, new_dir_name) == 0) {
+            utimensat(AT_FDCWD, new_dir_name, times, AT_SYMLINK_NOFOLLOW);
             rmdir(new_dir_name);
         } else {
+            utimensat(AT_FDCWD, td->path, times, AT_SYMLINK_NOFOLLOW);
             rmdir(td->path);
         }
+        /* fsync parent directory */
+        int pfd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (pfd >= 0) {
+            fsync(pfd);
+            close(pfd);
+        }
     } else {
+        struct timespec times[2] = {{0, 0}, {0, 0}};
+        utimensat(AT_FDCWD, td->path, times, AT_SYMLINK_NOFOLLOW);
         rmdir(td->path);
     }
     free(parent);
@@ -1124,7 +1164,7 @@ void *thread_wipe_dir(void *data) {
 
 void *thread_wipe_free(void *data) {
     ThreadData *td = (ThreadData *)data;
-    wipe_free_space(td->path, td->thread_count);
+    wipe_free_space(td->path, td->thread_count, &td->scheme);
     free(td->path);
     free(td);
     g_idle_add(idle_reset_ui, NULL);
@@ -1140,11 +1180,25 @@ void on_file_wipe_clicked(GtkButton *button G_GNUC_UNUSED, gpointer user_data G_
         set_ui_sensitive(FALSE);
         update_progress_bar(0.0);
         ThreadData *td = malloc(sizeof(ThreadData));
+        if (!td) {
+            log_message("Error: Failed to allocate memory");
+            g_idle_add(idle_reset_ui, NULL);
+            g_free(filename);
+            return;
+        }
         td->path = strdup(filename);
         td->thread_count = 1;
+        td->scheme = schemes[current_scheme_idx];
         pthread_t tid;
-        pthread_create(&tid, NULL, thread_wipe_file, td);
-        pthread_detach(tid);
+        int rc = pthread_create(&tid, NULL, thread_wipe_file, td);
+        if (rc != 0) {
+            log_message("Error: Failed to start file wipe thread");
+            free(td->path);
+            free(td);
+            g_idle_add(idle_reset_ui, NULL);
+        } else {
+            pthread_detach(tid);
+        }
         g_free(filename);
     }
 }
@@ -1157,11 +1211,25 @@ void on_directory_wipe_clicked(GtkButton *button G_GNUC_UNUSED, gpointer user_da
         set_ui_sensitive(FALSE);
         update_progress_bar(0.0);
         ThreadData *td = malloc(sizeof(ThreadData));
+        if (!td) {
+            log_message("Error: Failed to allocate memory");
+            g_idle_add(idle_reset_ui, NULL);
+            g_free(dirname);
+            return;
+        }
         td->path = strdup(dirname);
         td->thread_count = 1;
+        td->scheme = schemes[current_scheme_idx];
         pthread_t tid;
-        pthread_create(&tid, NULL, thread_wipe_dir, td);
-        pthread_detach(tid);
+        int rc = pthread_create(&tid, NULL, thread_wipe_dir, td);
+        if (rc != 0) {
+            log_message("Error: Failed to start directory wipe thread");
+            free(td->path);
+            free(td);
+            g_idle_add(idle_reset_ui, NULL);
+        } else {
+            pthread_detach(tid);
+        }
         g_free(dirname);
     }
 }
@@ -1174,11 +1242,25 @@ void on_free_space_wipe_clicked(GtkButton *button G_GNUC_UNUSED, gpointer user_d
         set_ui_sensitive(FALSE);
         update_progress_bar(0.0);
         ThreadData *td = malloc(sizeof(ThreadData));
+        if (!td) {
+            log_message("Error: Failed to allocate memory");
+            g_idle_add(idle_reset_ui, NULL);
+            g_free(dirname);
+            return;
+        }
         td->path = strdup(dirname);
         td->thread_count = (int)gtk_range_get_value(GTK_RANGE(threads_scale));
+        td->scheme = schemes[current_scheme_idx];
         pthread_t tid;
-        pthread_create(&tid, NULL, thread_wipe_free, td);
-        pthread_detach(tid);
+        int rc = pthread_create(&tid, NULL, thread_wipe_free, td);
+        if (rc != 0) {
+            log_message("Error: Failed to start free space wipe thread");
+            free(td->path);
+            free(td);
+            g_idle_add(idle_reset_ui, NULL);
+        } else {
+            pthread_detach(tid);
+        }
         g_free(dirname);
     }
 }
@@ -1194,7 +1276,7 @@ void on_ram_fill_clicked(GtkButton *button G_GNUC_UNUSED, gpointer user_data G_G
 }
 
 void on_stop_clicked(GtkButton *button G_GNUC_UNUSED, gpointer user_data G_GNUC_UNUSED) {
-    g_stop_flag = 1;
+    atomic_store(&g_stop_flag, true);
     log_message("STOP REQUESTED - Cleaning up safely...");
 }
 
@@ -1251,7 +1333,7 @@ void on_menu_about_activate(GtkMenuItem *menuitem G_GNUC_UNUSED, gpointer user_d
     gtk_box_pack_start(GTK_BOX(main_vbox), name_label, FALSE, FALSE, 0);
     
     GtkWidget *ver_label = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(ver_label), "<span color='#aaaaaa'>Version 2.5.5 \xe2\x80\xa2 Multi-Threaded Forensic-Grade Sanitization</span>");
+    gtk_label_set_markup(GTK_LABEL(ver_label), "<span color='#aaaaaa'>Version 2.6.0 \xe2\x80\xa2 Multi-Threaded Forensic-Grade Sanitization</span>");
     gtk_box_pack_start(GTK_BOX(main_vbox), ver_label, FALSE, FALSE, 5);
     
     GtkWidget *sep_top = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
@@ -2018,553 +2100,7 @@ GtkWidget* create_main_window(void) {
     return main_window;
 }
 
-#define SECRET_KEY "vWipe-Turbo-Super-Secret-Key-2026"
 
-/* SHA-256 Self-Contained Implementation */
-#define ROTLEFT(a,b) (((a) << (b)) | ((a) >> (32-(b))))
-#define ROTRIGHT(a,b) (((a) >> (b)) | ((a) << (32-(b))))
-
-#define CH(x,y,z) (((x) & (y)) ^ (~(x) & (z)))
-#define MAJ(x,y,z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
-#define EP0(x) (ROTRIGHT(x,2) ^ ROTRIGHT(x,13) ^ ROTRIGHT(x,22))
-#define EP1(x) (ROTRIGHT(x,6) ^ ROTRIGHT(x,11) ^ ROTRIGHT(x,25))
-#define SIG0(x) (ROTRIGHT(x,7) ^ ROTRIGHT(x,18) ^ ((x) >> 3))
-#define SIG1(x) (ROTRIGHT(x,17) ^ ROTRIGHT(x,19) ^ ((x) >> 10))
-
-typedef struct {
-    unsigned char data[64];
-    unsigned int datalen;
-    unsigned long long bitlen;
-    unsigned int state[8];
-} SHA256_CTX;
-
-static const unsigned int k[64] = {
-    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-};
-
-void sha256_transform(SHA256_CTX *ctx, const unsigned char data[]) {
-    unsigned int a, b, c, d, e, f, g, h, i, j, t1, t2, m[64];
-
-    for (i = 0, j = 0; i < 16; ++i, j += 4)
-        m[i] = (data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | (data[j + 3]);
-    for ( ; i < 64; ++i)
-        m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
-
-    a = ctx->state[0];
-    b = ctx->state[1];
-    c = ctx->state[2];
-    d = ctx->state[3];
-    e = ctx->state[4];
-    f = ctx->state[5];
-    g = ctx->state[6];
-    h = ctx->state[7];
-
-    for (i = 0; i < 64; ++i) {
-        t1 = h + EP1(e) + CH(e,f,g) + k[i] + m[i];
-        t2 = EP0(a) + MAJ(a,b,c);
-        h = g;
-        g = f;
-        f = e;
-        e = d + t1;
-        d = c;
-        c = b;
-        b = a;
-        a = t1 + t2;
-    }
-
-    ctx->state[0] += a;
-    ctx->state[1] += b;
-    ctx->state[2] += c;
-    ctx->state[3] += d;
-    ctx->state[4] += e;
-    ctx->state[5] += f;
-    ctx->state[6] += g;
-    ctx->state[7] += h;
-}
-
-void sha256_init(SHA256_CTX *ctx) {
-    ctx->datalen = 0;
-    ctx->bitlen = 0;
-    ctx->state[0] = 0x6a09e667;
-    ctx->state[1] = 0xbb67ae85;
-    ctx->state[2] = 0x3c6ef372;
-    ctx->state[3] = 0xa54ff53a;
-    ctx->state[4] = 0x510e527f;
-    ctx->state[5] = 0x9b05688c;
-    ctx->state[6] = 0x1f83d9ab;
-    ctx->state[7] = 0x5be0cd19;
-}
-
-void sha256_update(SHA256_CTX *ctx, const unsigned char data[], size_t len) {
-    unsigned int i;
-
-    for (i = 0; i < len; ++i) {
-        ctx->data[ctx->datalen] = data[i];
-        ctx->datalen++;
-        if (ctx->datalen == 64) {
-            sha256_transform(ctx, ctx->data);
-            ctx->bitlen += 512;
-            ctx->datalen = 0;
-        }
-    }
-}
-
-void sha256_final(SHA256_CTX *ctx, unsigned char hash[]) {
-    unsigned int i;
-
-    i = ctx->datalen;
-
-    if (ctx->datalen < 56) {
-        ctx->data[i++] = 0x80;
-        while (i < 56)
-            ctx->data[i++] = 0x00;
-    }
-    else {
-        ctx->data[i++] = 0x80;
-        while (i < 64)
-            ctx->data[i++] = 0x00;
-        sha256_transform(ctx, ctx->data);
-        memset(ctx->data, 0, 56);
-    }
-
-    ctx->bitlen += ctx->datalen * 8;
-    ctx->data[56] = ctx->bitlen >> 56;
-    ctx->data[57] = ctx->bitlen >> 48;
-    ctx->data[58] = ctx->bitlen >> 40;
-    ctx->data[59] = ctx->bitlen >> 32;
-    ctx->data[60] = ctx->bitlen >> 24;
-    ctx->data[61] = ctx->bitlen >> 16;
-    ctx->data[62] = ctx->bitlen >> 8;
-    ctx->data[63] = ctx->bitlen;
-    sha256_transform(ctx, ctx->data);
-
-    for (i = 0; i < 4; ++i) {
-        hash[i]      = (ctx->state[0] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 4]  = (ctx->state[1] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 8]  = (ctx->state[2] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 12] = (ctx->state[3] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 16] = (ctx->state[4] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 20] = (ctx->state[5] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 24] = (ctx->state[6] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 28] = (ctx->state[7] >> (24 - i * 8)) & 0x000000ff;
-    }
-}
-
-void sha256_hex(const char *data, size_t len, char *hex_output) {
-    SHA256_CTX ctx;
-    unsigned char hash[32];
-    sha256_init(&ctx);
-    sha256_update(&ctx, (const unsigned char*)data, len);
-    sha256_final(&ctx, hash);
-    for (int i = 0; i < 32; i++) {
-        sprintf(hex_output + (i * 2), "%02x", hash[i]);
-    }
-    hex_output[64] = '\0';
-}
-
-/* License & Trial Validation Helpers */
-int verify_license_file(const char *filepath) {
-    FILE *file = fopen(filepath, "r");
-    if (!file) return 0;
-
-    char line[256];
-    char customer[256] = {0};
-    char exp_date[64] = {0};
-    char signature[128] = {0};
-
-    while (fgets(line, sizeof(line), file)) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (strncmp(line, "CUSTOMER:", 9) == 0) {
-            char *val = line + 9;
-            while (*val == ' ' || *val == '\t') val++;
-            if (strlen(val) < sizeof(customer)) {
-                strcpy(customer, val);
-            }
-        } else if (strncmp(line, "EXPIRATION_DATE:", 16) == 0) {
-            char *val = line + 16;
-            while (*val == ' ' || *val == '\t') val++;
-            if (strlen(val) < sizeof(exp_date)) {
-                strcpy(exp_date, val);
-            }
-        } else if (strncmp(line, "SIGNATURE:", 10) == 0) {
-            char *val = line + 10;
-            while (*val == ' ' || *val == '\t') val++;
-            if (strlen(val) < sizeof(signature)) {
-                strcpy(signature, val);
-            }
-        }
-    }
-    fclose(file);
-
-    if (strlen(exp_date) == 0 || strlen(signature) == 0) {
-        return 0;
-    }
-
-    char input_for_hash[512];
-    if (strlen(customer) > 0) {
-        snprintf(input_for_hash, sizeof(input_for_hash), "%s:%s:%s", customer, exp_date, SECRET_KEY);
-    } else {
-        snprintf(input_for_hash, sizeof(input_for_hash), "%s%s", exp_date, SECRET_KEY);
-    }
-    char expected_sig[65];
-    sha256_hex(input_for_hash, strlen(input_for_hash), expected_sig);
-
-    if (strcmp(signature, expected_sig) != 0) {
-        return 0;
-    }
-
-    int exp_year = 0, exp_month = 0, exp_day = 0;
-    if (sscanf(exp_date, "%d-%d-%d", &exp_year, &exp_month, &exp_day) != 3) {
-        return 0;
-    }
-
-    time_t t = time(NULL);
-    struct tm *tm_info = localtime(&t);
-    int cur_year = tm_info->tm_year + 1900;
-    int cur_month = tm_info->tm_mon + 1;
-    int cur_day = tm_info->tm_mday;
-
-    if (cur_year < exp_year) return 1;
-    if (cur_year == exp_year) {
-        if (cur_month < exp_month) return 1;
-        if (cur_month == exp_month) {
-            if (cur_day <= exp_day) return 1;
-        }
-    }
-
-    return 0;
-}
-
-int get_trial_tries_left(const char *state_path) {
-    FILE *file = fopen(state_path, "r");
-    if (!file) {
-        return 3;
-    }
-
-    char line[256];
-    int tries = -1;
-    char hash_str[128] = {0};
-
-    while (fgets(line, sizeof(line), file)) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (strncmp(line, "TRIES:", 6) == 0) {
-            tries = atoi(line + 6);
-        } else if (strncmp(line, "HASH:", 5) == 0) {
-            char *val = line + 5;
-            while (*val == ' ' || *val == '\t') val++;
-            if (strlen(val) < sizeof(hash_str)) {
-                strcpy(hash_str, val);
-            }
-        }
-    }
-    fclose(file);
-
-    if (tries < 0 || tries > 3 || strlen(hash_str) == 0) {
-        return 0;
-    }
-
-    char hash_input[128];
-    snprintf(hash_input, sizeof(hash_input), "%d%s", tries, SECRET_KEY);
-    char expected_hash[65];
-    sha256_hex(hash_input, strlen(hash_input), expected_hash);
-
-    if (strcmp(hash_str, expected_hash) != 0) {
-        return 0;
-    }
-
-    return tries;
-}
-
-void set_trial_tries_left(const char *state_path, int tries) {
-    if (tries < 0) tries = 0;
-    if (tries > 3) tries = 3;
-
-    char hash_input[128];
-    snprintf(hash_input, sizeof(hash_input), "%d%s", tries, SECRET_KEY);
-    char hash_output[65];
-    sha256_hex(hash_input, strlen(hash_input), hash_output);
-
-    FILE *file = fopen(state_path, "w");
-    if (file) {
-        fprintf(file, "TRIES:%d\n", tries);
-        fprintf(file, "HASH:%s\n", hash_output);
-        fclose(file);
-    }
-}
-
-/* Dialog Callback Structures and Functions */
-struct LicenseDialogState {
-    int code;
-    GtkWidget *dialog;
-    char *path_buffer;
-    size_t path_max;
-    gboolean loop;
-};
-
-static void on_license_exit_clicked(GtkButton *button, gpointer data) {
-    (void)button;
-    struct LicenseDialogState *state = (struct LicenseDialogState*)data;
-    if (state->code == 0) {
-        state->code = 0;
-    }
-    state->loop = FALSE;
-}
-
-static void on_license_trial_clicked(GtkButton *button, gpointer data) {
-    (void)button;
-    struct LicenseDialogState *state = (struct LicenseDialogState*)data;
-    state->code = 1;
-    state->loop = FALSE;
-}
-
-static void on_license_load_clicked(GtkButton *button, gpointer data) {
-    (void)button;
-    struct LicenseDialogState *state = (struct LicenseDialogState*)data;
-
-    GtkWidget *chooser = gtk_file_chooser_dialog_new(
-        "Select License File",
-        GTK_WINDOW(state->dialog),
-        GTK_FILE_CHOOSER_ACTION_OPEN,
-        "_Cancel", GTK_RESPONSE_CANCEL,
-        "_Open", GTK_RESPONSE_ACCEPT,
-        NULL
-    );
-
-    GtkFileFilter *filter = gtk_file_filter_new();
-    gtk_file_filter_set_name(filter, "Text Files (*.txt)");
-    gtk_file_filter_add_pattern(filter, "*.txt");
-    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(chooser), filter);
-
-    if (gtk_dialog_run(GTK_DIALOG(chooser)) == GTK_RESPONSE_ACCEPT) {
-        char *filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
-        if (filename) {
-            strncpy(state->path_buffer, filename, state->path_max - 1);
-            state->path_buffer[state->path_max - 1] = '\0';
-            g_free(filename);
-
-            if (verify_license_file(state->path_buffer)) {
-                state->code = 2;
-                state->loop = FALSE;
-            } else {
-                GtkWidget *err_dialog = gtk_message_dialog_new(
-                    GTK_WINDOW(state->dialog),
-                    GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                    GTK_MESSAGE_ERROR,
-                    GTK_BUTTONS_OK,
-                    "Invalid license file! Please select a valid 1-year vWipe Turbo license."
-                );
-                gtk_dialog_run(GTK_DIALOG(err_dialog));
-                gtk_widget_destroy(err_dialog);
-            }
-        }
-    }
-    gtk_widget_destroy(chooser);
-}
-
-int check_license_verification(void) {
-    char license_save_path[1024];
-    char state_path[1024];
-    char *home = getenv("HOME");
-    if (!home) return 0;
-
-    snprintf(license_save_path, sizeof(license_save_path), "%s/.vwipe_license", home);
-    snprintf(state_path, sizeof(state_path), "%s/.vwipe_state", home);
-
-    if (verify_license_file(license_save_path)) {
-        return 1;
-    }
-
-    int tries_left = get_trial_tries_left(state_path);
-
-    char selected_path[1024] = {0};
-    struct LicenseDialogState dstate = {0, NULL, selected_path, sizeof(selected_path), TRUE};
-
-    GtkWidget *dialog = gtk_dialog_new();
-    gtk_window_set_title(GTK_WINDOW(dialog), "License Activation - vWipe Turbo");
-    gtk_window_set_default_size(GTK_WINDOW(dialog), 500, 320);
-    gtk_window_set_position(GTK_WINDOW(dialog), GTK_WIN_POS_CENTER);
-    gtk_window_set_resizable(GTK_WINDOW(dialog), FALSE);
-
-    dstate.dialog = dialog;
-
-    GtkCssProvider *cp = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(cp,
-        "dialog { background-color: #0c0e14; color: #cbd5e1; }\n"
-        "box { background-color: #0c0e14; }\n"
-        ".dialog-card { background-color: #111420; border: 1px solid #1e293b; border-radius: 8px; padding: 15px; }\n"
-        ".dialog-title { font-size: 18px; font-weight: bold; color: #ffffff; }\n"
-        ".dialog-warning { font-size: 14px; font-weight: bold; color: #f59e0b; }\n"
-        ".dialog-expired { font-size: 14px; font-weight: bold; color: #ef4444; }\n"
-        ".action-btn { background-image: linear-gradient(to bottom right, #00f0ff, #0072ff); color: #ffffff; font-weight: bold; border: none; border-radius: 6px; padding: 10px 20px; }\n"
-        ".action-btn:hover { background-image: linear-gradient(to bottom right, #33f4ff, #338eff); }\n"
-        ".trial-btn { background-color: #1e293b; color: #cbd5e1; border: 1px solid #334155; border-radius: 6px; padding: 10px 20px; font-weight: bold; }\n"
-        ".trial-btn:hover { background-color: #334155; color: #ffffff; }\n"
-        ".exit-btn { background-image: linear-gradient(to bottom right, #ef4444, #b91c1c); color: #ffffff; font-weight: bold; border: none; border-radius: 6px; padding: 10px 20px; }\n"
-        ".exit-btn:hover { background-image: linear-gradient(to bottom right, #f87171, #dc2626); }",
-        -1, NULL);
-
-    GtkStyleContext *dialog_context = gtk_widget_get_style_context(dialog);
-    gtk_style_context_add_provider(dialog_context, GTK_STYLE_PROVIDER(cp), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-
-    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 15);
-    gtk_container_set_border_width(GTK_CONTAINER(vbox), 25);
-    gtk_container_add(GTK_CONTAINER(content_area), vbox);
-
-    const char *vwipe_icon_paths[] = {
-        "/usr/local/share/icons/hicolor/scalable/apps/vwipe_icon.svg",
-        "/usr/share/icons/hicolor/scalable/apps/vwipe_icon.svg",
-        "~/.local/share/icons/hicolor/scalable/apps/vwipe_icon.svg",
-        "/usr/local/share/icons/hicolor/256x256/apps/vwipe.png",
-        "/usr/share/icons/hicolor/256x256/apps/vwipe.png",
-        "~/.local/share/icons/hicolor/256x256/apps/vwipe.png",
-        "vwipe_icon.svg",
-        "vwipe.png",
-        NULL
-    };
-    GdkPixbuf *pb = NULL;
-    for (int i = 0; vwipe_icon_paths[i] != NULL; i++) {
-        char expanded[1024];
-        if (vwipe_icon_paths[i][0] == '~') {
-            snprintf(expanded, sizeof(expanded), "%s%s", getenv("HOME"), vwipe_icon_paths[i] + 1);
-        } else {
-            strncpy(expanded, vwipe_icon_paths[i], sizeof(expanded)-1);
-            expanded[sizeof(expanded)-1] = '\0';
-        }
-        pb = gdk_pixbuf_new_from_file_at_size(expanded, 64, 64, NULL);
-        if (pb) break;
-    }
-    GtkWidget *icon_img;
-    if (pb) {
-        icon_img = gtk_image_new_from_pixbuf(pb);
-        g_object_unref(pb);
-    } else {
-        icon_img = gtk_image_new_from_icon_name("applications-system", GTK_ICON_SIZE_DIALOG);
-    }
-    gtk_box_pack_start(GTK_BOX(vbox), icon_img, FALSE, FALSE, 0);
-
-    GtkWidget *lbl_title = gtk_label_new("vWipe Turbo Activation");
-    GtkStyleContext *title_context = gtk_widget_get_style_context(lbl_title);
-    gtk_style_context_add_class(title_context, "dialog-title");
-    gtk_style_context_add_provider(title_context, GTK_STYLE_PROVIDER(cp), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    gtk_box_pack_start(GTK_BOX(vbox), lbl_title, FALSE, FALSE, 0);
-
-    GtkWidget *msg_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    GtkStyleContext *card_context = gtk_widget_get_style_context(msg_card);
-    gtk_style_context_add_class(card_context, "dialog-card");
-    gtk_style_context_add_provider(card_context, GTK_STYLE_PROVIDER(cp), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    gtk_box_pack_start(GTK_BOX(vbox), msg_card, TRUE, TRUE, 0);
-
-    GtkWidget *lbl_status = gtk_label_new(NULL);
-    GtkStyleContext *status_context = gtk_widget_get_style_context(lbl_status);
-    gtk_style_context_add_provider(status_context, GTK_STYLE_PROVIDER(cp), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-
-    GtkWidget *lbl_desc = gtk_label_new(NULL);
-    gtk_label_set_justify(GTK_LABEL(lbl_desc), GTK_JUSTIFY_CENTER);
-    gtk_label_set_line_wrap(GTK_LABEL(lbl_desc), TRUE);
-
-    if (tries_left > 0) {
-        char status_txt[128];
-        snprintf(status_txt, sizeof(status_txt), "Trial Period Active: %d %s Left", tries_left, tries_left == 1 ? "Try" : "Tries");
-        gtk_label_set_text(GTK_LABEL(lbl_status), status_txt);
-        gtk_style_context_add_class(status_context, "dialog-warning");
-
-        gtk_label_set_text(GTK_LABEL(lbl_desc),
-            "Virtual Wipe Turbo requires a valid 1-year license to run.\n"
-            "You can choose to continue the trial, or load a license file (.txt).");
-    } else {
-        gtk_label_set_text(GTK_LABEL(lbl_status), "Trial Period Expired");
-        gtk_style_context_add_class(status_context, "dialog-expired");
-
-        gtk_label_set_text(GTK_LABEL(lbl_desc),
-            "The trial period has expired. You can no longer run Virtual Wipe Turbo.\n"
-            "Please select a valid license file (.txt) to continue using the software.");
-    }
-
-    gtk_box_pack_start(GTK_BOX(msg_card), lbl_status, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(msg_card), lbl_desc, TRUE, TRUE, 0);
-
-    GtkWidget *btn_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-    gtk_widget_set_halign(btn_hbox, GTK_ALIGN_CENTER);
-    gtk_box_pack_start(GTK_BOX(vbox), btn_hbox, FALSE, FALSE, 5);
-
-    GtkWidget *btn_exit = gtk_button_new_with_label("Exit");
-    GtkStyleContext *exit_context = gtk_widget_get_style_context(btn_exit);
-    gtk_style_context_add_class(exit_context, "exit-btn");
-    gtk_style_context_add_provider(exit_context, GTK_STYLE_PROVIDER(cp), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    gtk_box_pack_start(GTK_BOX(btn_hbox), btn_exit, FALSE, FALSE, 0);
-
-    GtkWidget *btn_trial = NULL;
-    if (tries_left > 0) {
-        btn_trial = gtk_button_new_with_label("Continue Trial");
-        GtkStyleContext *trial_context = gtk_widget_get_style_context(btn_trial);
-        gtk_style_context_add_class(trial_context, "trial-btn");
-        gtk_style_context_add_provider(trial_context, GTK_STYLE_PROVIDER(cp), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-        gtk_box_pack_start(GTK_BOX(btn_hbox), btn_trial, FALSE, FALSE, 0);
-    }
-
-    GtkWidget *btn_load = gtk_button_new_with_label("Load License File");
-    GtkStyleContext *load_context = gtk_widget_get_style_context(btn_load);
-    gtk_style_context_add_class(load_context, "action-btn");
-    gtk_style_context_add_provider(load_context, GTK_STYLE_PROVIDER(cp), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    gtk_box_pack_start(GTK_BOX(btn_hbox), btn_load, FALSE, FALSE, 0);
-
-    g_signal_connect(btn_exit, "clicked", G_CALLBACK(on_license_exit_clicked), &dstate);
-    g_signal_connect(dialog, "destroy", G_CALLBACK(on_license_exit_clicked), &dstate);
-    if (btn_trial) {
-        g_signal_connect(btn_trial, "clicked", G_CALLBACK(on_license_trial_clicked), &dstate);
-    }
-    g_signal_connect(btn_load, "clicked", G_CALLBACK(on_license_load_clicked), &dstate);
-
-    gtk_widget_show_all(dialog);
-
-    while (dstate.loop) {
-        g_main_context_iteration(NULL, TRUE);
-    }
-
-    gtk_widget_destroy(dialog);
-    g_object_unref(cp);
-
-    if (dstate.code == 2) {
-        FILE *src = fopen(selected_path, "r");
-        if (src) {
-            FILE *dest = fopen(license_save_path, "w");
-            if (dest) {
-                char ch;
-                while ((ch = fgetc(src)) != EOF) {
-                    fputc(ch, dest);
-                }
-                fclose(dest);
-            }
-            fclose(src);
-        }
-
-        GtkWidget *success_dialog = gtk_message_dialog_new(
-            NULL,
-            GTK_DIALOG_MODAL,
-            GTK_MESSAGE_INFO,
-            GTK_BUTTONS_OK,
-            "License activated successfully! Thank you for purchasing vWipe Turbo."
-        );
-        gtk_dialog_run(GTK_DIALOG(success_dialog));
-        gtk_widget_destroy(success_dialog);
-
-        return 1;
-    } else if (dstate.code == 1) {
-        tries_left--;
-        set_trial_tries_left(state_path, tries_left);
-        return 1;
-    }
-
-    return 0;
-}
 
 int main(int argc, char *argv[]) {
     gtk_init(&argc, &argv);
@@ -2574,7 +2110,7 @@ int main(int argc, char *argv[]) {
     GtkWidget *window = create_main_window();
     gtk_widget_show_all(window);
 
-    log_message("vWipe Turbo v2.5.5 initialized - Forensic Parallel Sanitizer Active");
+    log_message("vWipe Turbo v2.6.0 initialized - Forensic Parallel Sanitizer Active");
     log_message("Ready for secure data sanitization operations");
 
     gtk_main();

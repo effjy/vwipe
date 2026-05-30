@@ -1,10 +1,4 @@
-# Virtual Wipe Turbo v2.5.5
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Standard](https://img.shields.io/badge/standard-NIST%20SP%20800--88-blue)]()
-[![RAM](https://img.shields.io/badge/RAM-Sanitizer-brightgreen)]()
-[![Threads](https://img.shields.io/badge/threads-8--core-orange)]()
-[![Krakken](https://img.shields.io/badge/Powered%20by-Krakken--2048-00FFCC)](https://github.com/effjy/krakken)
+# Virtual Wipe Turbo v2.6.0
 
 **Virtual Wipe Turbo** is a state-of-the-art secure data sanitization tool designed for high-performance forensic-grade wiping. Engineered to leverage modern multi-core processors, it utilizes a parallel "Turbo Engine" to saturate NVMe throughput, ensuring the fastest possible sanitization while maintaining strict compliance with international security standards.
 
@@ -70,12 +64,17 @@ This will install `vwipe` to `/usr/local/bin` and add a desktop entry with the o
 ## ⚖️ Forensic Note
 On **Copy-on-Write (CoW)** filesystems like Btrfs, ZFS, or APFS, individual file wiping may be bypassed by the filesystem controller. In these cases, **Free Space Sanitization** is the recommended method to ensure data destruction.
 
-## 🔗 Related Projects
+## 🔄 Release Updates & Bug Fixes (v2.6.0)
 
-- **[Krakken-2048 Abyssal](https://github.com/effjy/krakken)** – The 2048‑bit SPN‑ARX hybrid cryptographic permutation.
-- **[Krakken-Disk](https://github.com/effjy/krakken-disk)** – Post‑quantum encrypted disk manager using the Krakken permutation.
+Version 2.6.0 resolves multiple logic bugs, thread safety data races, and potential vulnerabilities:
+- **Directory Metadata Purging**: Wipes access/modification times and issues parent directory `fsync` calls to ensure directory entry removals are committed to disk.
+- **Wipe TRIM Fix**: Re-ordered deletion sequence to call `attempt_trim` before unlinking files so storage TRIM works properly.
+- **Thread Safety & Atomicity**: Isolated active scheme parameters in worker contexts and upgraded progress metric counters to atomic structures.
+- **RAM Module Safety**: Patched incorrect `mlock` capability checking, async-signal safety bugs in handler routines, and seeded random passes cryptographically.
 
-*These projects are part of the Krakken cryptographic ecosystem.*
+For the full detailed breakdown of fixes, see [UPDATE.md](file:///home/user/data/utils/vwipe/UPDATE.md).
 
 ## 📄 License
-Copyright © 2026 Jean-François Lachance-Caumartin. Licensed under the MIT License.
+This project is licensed under the MIT License. See the LICENSE file for details.
+
+Copyright © 2026 Jean-Francois Lachance-Caumartin. All rights reserved.

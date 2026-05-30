@@ -61,8 +61,6 @@ void signal_handler(int sig) {
     (void)sig;
     g_stop_flag = 1;
     fill_keep_running = 0;
-    printf("\n\n[!] Interrupt received - Cleaning up safely...\n");
-    restore_terminal();
 }
 
 /* Restore terminal settings */
@@ -98,8 +96,19 @@ int check_for_stop_interrupt(void) {
 
 /* Startup compliance check */
 void startup_compliance_check(void) {
-    g_mlock_supported = (mlock((void *)0x1000, 4096) == 0 || errno != EPERM);
-    if (g_mlock_supported) munlock((void *)0x1000, 4096);
+    /* Improved mlock check using a heap-allocated page */
+    void *test_page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (test_page != MAP_FAILED) {
+        if (mlock(test_page, 4096) == 0) {
+            g_mlock_supported = 1;
+            munlock(test_page, 4096);
+        } else {
+            g_mlock_supported = 0;
+        }
+        munmap(test_page, 4096);
+    } else {
+        g_mlock_supported = 0;
+    }
     
     prctl(PR_SET_DUMPABLE, 0);
     struct rlimit rl = {0, 0};
@@ -177,12 +186,19 @@ void fill_ram(unsigned long safety_mb) {
 
     if (block_count == 0) {
         printf("[!] Failed to allocate any memory blocks.\n");
+        free(allocated_blocks);
+        allocated_blocks = NULL;
         restore_terminal();
         return;
     }
 
     /* Sanitization passes */
     const char *pass_names[] = {"Zeros (0x00)", "Ones (0xFF)", "Random Pattern"};
+    uint64_t secure_seed = 0;
+    if (getrandom(&secure_seed, sizeof(secure_seed), 0) < 0) {
+        secure_seed = (uint64_t)time(NULL);
+    }
+    
     for (int p = 0; p < 3 && fill_keep_running; p++) {
         printf("[*] Pass %d/3: %s\n", p + 1, pass_names[p]);
         
@@ -192,8 +208,8 @@ void fill_ram(unsigned long safety_mb) {
             if (p == 0) memset(ptr, 0x00, chunk_size);
             else if (p == 1) memset(ptr, 0xFF, chunk_size);
             else {
-                /* Random pass using splitmix64 for speed */
-                uint64_t state = (uint64_t)time(NULL) ^ (uint64_t)i ^ (uintptr_t)ptr;
+                /* Random pass using splitmix64 for speed, seeded securely */
+                uint64_t state = secure_seed ^ (uint64_t)i ^ (uintptr_t)ptr;
                 uint64_t *ptr64 = (uint64_t *)ptr;
                 for (size_t j = 0; j < chunk_size / 8; j++) {
                     uint64_t z = (state += 0x9e3779b97f4a7c15);
@@ -219,6 +235,14 @@ void fill_ram(unsigned long safety_mb) {
         time_t elapsed = time(NULL) - start_time;
         printf("\n[+] RAM sanitization complete: %.2f GB processed in %lu seconds\n", 
                allocated / (1024.0 * 1024.0 * 1024.0), (unsigned long)elapsed);
+               
+        /* Clear any leftover input in STDIN without blocking */
+        struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
+        while (poll(&pfd, 1, 0) > 0) {
+            int ch = getchar();
+            if (ch == '\n' || ch == EOF) break;
+        }
+        
         printf("[i] Press Enter to release memory and exit...\n");
         fflush(stdout);
         getchar();

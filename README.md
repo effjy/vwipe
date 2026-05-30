@@ -1,5 +1,12 @@
 # Virtual Wipe Turbo v2.6.0
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-2.6.0-brightgreen)]()
+[![Language](https://img.shields.io/badge/language-C-blue)]()
+[![Platform](https://img.shields.io/badge/platform-Linux-important)]()
+[![Standards](https://img.shields.io/badge/standards-NIST%20%2F%20FIPS-blue)]()
+[![Turbo Engine](https://img.shields.io/badge/engine-8--core%20Turbo-00FFCC)]()
+
 **Virtual Wipe Turbo** is a high-performance, forensic-grade secure data sanitization suite engineered for maximum speed and uncompromising security. Leveraging a multi-core "Turbo Engine," it saturates modern NVMe and SSD throughput while maintaining full compliance with rigorous international standards.
 
 Built for security professionals, forensic investigators, and privacy-conscious users who demand both speed and mathematical certainty.

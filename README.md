@@ -13,6 +13,16 @@ Built for security professionals, forensic investigators, and privacy-conscious 
 
 ---
 
+## 📸 Screenshot
+
+<div align="center">
+  <img src="screenshot.png" alt="Virtual Wipe Turbo - Main Interface" width="600"/>
+  <br/>
+  <em>Forensic-grade data sanitization suite — dark-themed GTK interface with multi-core Turbo Engine</em>
+</div>
+
+---
+
 ## 🚀 Key Features
 
 - ⚡ **8-Core Turbo-Wipe Engine** — Automatically detects CPU topology and deploys parallel workers to fully saturate storage bandwidth.

@@ -894,11 +894,12 @@ void *free_space_worker(void *data) {
             break;
         }
         
-        /* Use synchronous I/O for security */
-        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_SYNC);
+        /* O_SYNC removed: we use fsync() at file completion instead,
+         * which provides the same durability guarantee without blocking
+         * every individual write() call and freezing the UI. */
         tmp_files[tmp_count++] = tmpname;
         
-        size_t chunk = BUFFER_SIZE * 128; /* 512MB files for parallel efficiency */
+        size_t chunk = BUFFER_SIZE * 16; /* 64MB files: smoother progress & less memory pressure */
         size_t off = 0;
         
         for (int p = 0; p < wd->scheme.pass_count && !g_stop_flag; p++) {
@@ -935,7 +936,10 @@ void *free_space_worker(void *data) {
                 }
                 off += (size_t)ret;
                 atomic_fetch_add(&g_bytes_written, (size_t)ret);
-                if (atomic_load(&g_bytes_written) % (BUFFER_SIZE * 4) == 0) {
+                static _Thread_local gint64 last_free_progress_time = 0;
+                gint64 now_mono = g_get_monotonic_time();
+                if (now_mono - last_free_progress_time > 200000) { /* every 200ms */
+                    last_free_progress_time = now_mono;
                     update_progress("Sanitizing free space (Parallel)");
                 }
             }

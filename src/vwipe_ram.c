@@ -169,8 +169,13 @@ void fill_ram(unsigned long safety_mb) {
         void *block = aligned_alloc(PAGE_SIZE, chunk_size);
         if (!block) break;
         
-        if (g_mlock_supported && mlock(block, chunk_size) != 0) g_mlock_supported = 0;
-        
+        /* Lock this block if locking is currently supported. If a lock fails
+         * (e.g. RLIMIT_MEMLOCK reached), stop attempting further locks but keep
+         * already-locked blocks tracked so release_ram() can unlock them. */
+        if (g_mlock_supported && mlock(block, chunk_size) != 0) {
+            g_mlock_supported = 0;
+        }
+
         allocated_blocks[i] = block;
         block_count++;
         allocated += chunk_size;
@@ -272,7 +277,10 @@ void release_ram(void) {
                     secure_memzero(ptr + offset, current_clear);
                 }
                 
-                if (g_mlock_supported) munlock(allocated_blocks[i], chunk_size);
+                /* munlock unconditionally: harmless (EINVAL) on blocks that
+                 * were never locked, and avoids leaking locks on blocks that
+                 * were locked before g_mlock_supported was cleared mid-run. */
+                munlock(allocated_blocks[i], chunk_size);
                 free(allocated_blocks[i]);
                 allocated_blocks[i] = NULL;
                 
@@ -292,6 +300,31 @@ void release_ram(void) {
     }
 }
 
+/* Pidfile so the GUI can signal THIS process directly, regardless of which
+ * terminal emulator was used to launch it (some, e.g. gnome-terminal, hand the
+ * command to a background server so the spawned PID isn't ours). */
+static char g_pidfile_path[512];
+
+static void compute_pidfile_path(void) {
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    if (!dir || !*dir) dir = "/tmp";
+    snprintf(g_pidfile_path, sizeof(g_pidfile_path), "%s/vwipe_ram.pid", dir);
+}
+
+static void remove_pidfile(void) {
+    if (g_pidfile_path[0]) unlink(g_pidfile_path);
+}
+
+static void write_pidfile(void) {
+    compute_pidfile_path();
+    FILE *f = fopen(g_pidfile_path, "w");
+    if (f) {
+        fprintf(f, "%ld\n", (long)getpid());
+        fclose(f);
+        atexit(remove_pidfile);  /* removed on normal/graceful (signal-driven) exit */
+    }
+}
+
 int main(int argc, char *argv[]) {
     unsigned long safety_mb = DEFAULT_SAFETY_MB;
     
@@ -308,10 +341,23 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    /* Set up signal handlers */
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    
+    /* Set up signal handlers.
+     * SIGHUP is handled so that when the GUI's Stop button closes the parent
+     * terminal, this process still runs its graceful stop + cleanup path
+     * instead of being killed outright. sa_flags is left at 0 (no SA_RESTART)
+     * so a signal also interrupts a blocking getchar() at the final prompt. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+
+    /* Publish our PID so the GUI can stop us directly. */
+    write_pidfile();
+
     startup_compliance_check();
     
     printf("Virtual Wipe - RAM Fill Module\n");

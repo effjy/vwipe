@@ -1,7 +1,7 @@
-# Virtual Wipe Turbo v2.6.0
+# Virtual Wipe Turbo v2.7.0
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.6.0-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-2.7.0-brightgreen)]()
 [![Language](https://img.shields.io/badge/language-C-blue)]()
 [![Platform](https://img.shields.io/badge/platform-Linux-important)]()
 [![Standards](https://img.shields.io/badge/standards-NIST%20%2F%20FIPS-blue)]()
@@ -83,9 +83,9 @@ On Copy-on-Write filesystems (Btrfs, ZFS, APFS), traditional file-level wiping c
 
 ---
 
-## 🔄 v2.6.0 Release Highlights
+## 🔄 v2.7.0 Release Highlights
 
-Version 2.6.0 brings significant stability, security, and correctness improvements:
+Version 2.7.0 brings significant stability, security, and correctness improvements:
 
 - Enhanced directory metadata purging with parent `fsync()` to guarantee removal of file entries
 - Fixed TRIM sequencing to ensure proper SSD wear-leveling cooperation

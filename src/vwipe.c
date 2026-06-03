@@ -106,6 +106,9 @@ int current_scheme_idx = 3;
 atomic_bool g_operation_running = false;
 pthread_mutex_t g_progress_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* PID of the externally-spawned RAM fill process (0 if none running) */
+GPid g_ram_fill_pid = 0;
+
 /* NIST SP 800-88 Rev. 1 Aligned Sanitization Schemes */
 const WipeScheme schemes[] = {
     {1, "NIST Clear (Baseline) (weak)",        "NIST SP 800-88 Rev. 1 §4.1",  {PASS_ZERO}, 1},
@@ -470,6 +473,7 @@ void on_ram_fill_child_exited(GPid pid, gint status, gpointer user_data G_GNUC_U
         log_message("[!] RAM fill process was terminated by signal");
     }
     
+    if (g_ram_fill_pid == pid) g_ram_fill_pid = 0;
     g_spawn_close_pid(pid);
     g_idle_add(idle_reset_ui, NULL);
 }
@@ -568,7 +572,8 @@ void launch_ram_fill(unsigned long safety_mb) {
             if (g_spawn_async(NULL, argv, NULL, G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_SEARCH_PATH, 
                              NULL, NULL, &pid, &error)) {
                 g_strfreev(argv);
-                
+                g_ram_fill_pid = pid;
+
                 char log_msg[512];
                 snprintf(log_msg, sizeof(log_msg), "RAM fill launched in terminal (safety margin: %lu MB)", safety_mb);
                 log_message(log_msg);
@@ -625,7 +630,7 @@ int wipe_file(const char *path, const WipeScheme *scheme) {
 
     size_t file_size = (size_t)st.st_size;
     atomic_store(&g_target_bytes, file_size * scheme->pass_count);
-    g_bytes_written = 0;
+    atomic_store(&g_bytes_written, 0);
     g_start_time = time(NULL);
     
     char msg[512];
@@ -854,6 +859,14 @@ int wipe_directory_recursive(const char *path, const WipeScheme *scheme) {
             }
         } else if (S_ISREG(st.st_mode)) {
             wipe_file(fullpath, scheme);
+        } else {
+            /* Symlinks, device nodes, sockets, FIFOs: contents can't be
+             * sanitized, but the entry must be removed or the parent rmdir
+             * will fail on a non-empty directory. */
+            char skipmsg[4200];
+            snprintf(skipmsg, sizeof(skipmsg), "Removing non-regular entry (not overwritten): %s", fullpath);
+            log_message(skipmsg);
+            unlink(fullpath);
         }
     }
     closedir(dir);
@@ -873,16 +886,29 @@ void *free_space_worker(void *data) {
     char tmp_template[4200];
     snprintf(tmp_template, sizeof(tmp_template), "%s/.secure_wipe_free_t%d_XXXXXX", wd->path, wd->thread_id);
     
-    char **tmp_files = malloc(128 * sizeof(char *));
+    /* Dynamically grown list of temp files created by this thread so we can
+     * keep filling free space regardless of how large the volume is. */
+    size_t tmp_capacity = 128;
     int tmp_count = 0;
-    
+    char **tmp_files = malloc(tmp_capacity * sizeof(char *));
+    if (!tmp_files) { free(wd); return NULL; }
+
     unsigned char *buf = aligned_alloc(4096, BUFFER_SIZE);
-    if (!buf) { free(wd); return NULL; }
-    
+    if (!buf) { free(tmp_files); free(wd); return NULL; }
+
     if (g_mlock_supported) mlock(buf, BUFFER_SIZE);
+
+    /* Per-thread cryptographic base seed; each written block derives a unique
+     * seed from it so random data never repeats within or across files. */
+    uint64_t base_seed = 0;
+    if (get_secure_random(&base_seed, sizeof(base_seed)) != 0) {
+        base_seed = (uint64_t)time(NULL) ^ (uintptr_t)buf ^ (uint64_t)wd->thread_id;
+    }
+    uint64_t block_counter = 0;
 
     while (atomic_load(&g_bytes_written) < atomic_load(&g_target_bytes) && !g_stop_flag) {
         char *tmpname = strdup(tmp_template);
+        if (!tmpname) { g_stop_flag = true; break; }
         int fd = mkstemp(tmpname);
         if (fd < 0) {
             free(tmpname);
@@ -893,20 +919,23 @@ void *free_space_worker(void *data) {
             }
             break;
         }
-        
+
         /* O_SYNC removed: we use fsync() at file completion instead,
          * which provides the same durability guarantee without blocking
          * every individual write() call and freezing the UI. */
+        if ((size_t)tmp_count >= tmp_capacity) {
+            size_t new_cap = tmp_capacity * 2;
+            char **grown = realloc(tmp_files, new_cap * sizeof(char *));
+            if (!grown) { close(fd); unlink(tmpname); free(tmpname); g_stop_flag = true; break; }
+            tmp_files = grown;
+            tmp_capacity = new_cap;
+        }
         tmp_files[tmp_count++] = tmpname;
-        
+
         size_t chunk = BUFFER_SIZE * 16; /* 64MB files: smoother progress & less memory pressure */
         size_t off = 0;
-        
+
         for (int p = 0; p < wd->scheme.pass_count && !g_stop_flag; p++) {
-            /* Unique seed per thread/pass/file */
-            uint64_t seed = (uint64_t)time(NULL) ^ (uintptr_t)buf ^ (uint64_t)wd->thread_id ^ (uint64_t)tmp_count;
-            fill_buffer(buf, BUFFER_SIZE, wd->scheme.passes[p], seed);
-            
             lseek(fd, 0, SEEK_SET);
             off = 0;
             while (off < chunk && !g_stop_flag && (p > 0 || atomic_load(&g_bytes_written) < atomic_load(&g_target_bytes))) {
@@ -922,6 +951,10 @@ void *free_space_worker(void *data) {
                     chunk = off;
                     break;
                 }
+
+                /* Fresh, unique pattern for every block written. */
+                uint64_t seed = splitmix64(&base_seed) ^ (block_counter++);
+                fill_buffer(buf, tw, wd->scheme.passes[p], seed);
 
                 ssize_t ret = write(fd, buf, tw);
                 if (ret <= 0) {
@@ -948,16 +981,14 @@ void *free_space_worker(void *data) {
         }
         close(fd);
         if (g_stop_flag) break;
-        
-        if (tmp_count >= 120) break; /* Safety limit per thread */
     }
-    
+
     /* Cleanup this thread's files */
     for (int i = 0; i < tmp_count; i++) {
         unlink(tmp_files[i]);
         free(tmp_files[i]);
     }
-    
+
     secure_memzero(buf, BUFFER_SIZE);
     if (g_mlock_supported) munlock(buf, BUFFER_SIZE);
     free(buf);
@@ -1124,7 +1155,7 @@ void *thread_wipe_dir(void *data) {
     log_message("Pre-scanning directory for size estimation...");
     uint64_t total_size = calculate_dir_size(td->path);
     atomic_store(&g_target_bytes, (size_t)total_size * td->scheme.pass_count);
-    g_bytes_written = 0;
+    atomic_store(&g_bytes_written, 0);
     
     char msg[512];
     snprintf(msg, sizeof(msg), "Recursively sanitizing directory (Total: %.2f MB)...", total_size / 1048576.0);
@@ -1279,9 +1310,39 @@ void on_ram_fill_clicked(GtkButton *button G_GNUC_UNUSED, gpointer user_data G_G
     launch_ram_fill(safety_mb);
 }
 
+/* Read the PID that vwipe_ram published, so we can signal it directly
+ * regardless of which terminal emulator launched it. Returns 0 if unavailable. */
+static pid_t read_ram_fill_pidfile(void) {
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    if (!dir || !*dir) dir = "/tmp";
+    char path[512];
+    snprintf(path, sizeof(path), "%s/vwipe_ram.pid", dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    long pid = 0;
+    if (fscanf(f, "%ld", &pid) != 1) pid = 0;
+    fclose(f);
+    return (pid > 0) ? (pid_t)pid : 0;
+}
+
 void on_stop_clicked(GtkButton *button G_GNUC_UNUSED, gpointer user_data G_GNUC_UNUSED) {
     atomic_store(&g_stop_flag, true);
     log_message("STOP REQUESTED - Cleaning up safely...");
+
+    /* The RAM fill runs in a separate spawned process; the in-process stop
+     * flag does not reach it, so terminate it explicitly. Prefer the PID that
+     * vwipe_ram published (works for all terminals), and also signal the
+     * spawned terminal PID as a fallback in case the pidfile isn't there yet. */
+    if (g_ram_fill_pid > 0) {
+        pid_t rpid = read_ram_fill_pidfile();
+        if (rpid > 0) {
+            kill(rpid, SIGTERM);
+            log_message("Sent stop signal to RAM fill process.");
+        } else {
+            kill(g_ram_fill_pid, SIGTERM);
+            log_message("Sent stop signal to RAM fill terminal.");
+        }
+    }
 }
 
 void on_window_destroy(GtkWidget *widget G_GNUC_UNUSED, gpointer user_data G_GNUC_UNUSED) {
@@ -1337,7 +1398,7 @@ void on_menu_about_activate(GtkMenuItem *menuitem G_GNUC_UNUSED, gpointer user_d
     gtk_box_pack_start(GTK_BOX(main_vbox), name_label, FALSE, FALSE, 0);
     
     GtkWidget *ver_label = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(ver_label), "<span color='#aaaaaa'>Version 2.6.0 \xe2\x80\xa2 Multi-Threaded Forensic-Grade Sanitization</span>");
+    gtk_label_set_markup(GTK_LABEL(ver_label), "<span color='#aaaaaa'>Version 2.7.0 \xe2\x80\xa2 Multi-Threaded Forensic-Grade Sanitization</span>");
     gtk_box_pack_start(GTK_BOX(main_vbox), ver_label, FALSE, FALSE, 5);
     
     GtkWidget *sep_top = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
@@ -1499,8 +1560,9 @@ gboolean update_dashboard_stats(gpointer user_data G_GNUC_UNUSED) {
         double used_gb = total_gb - free_gb;
         
         char ram_text[128];
-        snprintf(ram_text, sizeof(ram_text), "%.1f / %.1f GB (%.0f%%)", 
-                 used_gb, total_gb, (used_gb / total_gb) * 100.0);
+        double pct = total_gb > 0.0 ? (used_gb / total_gb) * 100.0 : 0.0;
+        snprintf(ram_text, sizeof(ram_text), "%.1f / %.1f GB (%.0f%%)",
+                 used_gb, total_gb, pct);
         gtk_label_set_text(GTK_LABEL(lbl_dash_ram), ram_text);
     }
     
@@ -1728,6 +1790,8 @@ GtkWidget* create_main_window(void) {
     gtk_box_pack_start(GTK_BOX(page0), grid, FALSE, FALSE, 0);
 
     int cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cores < 1) cores = 1;
+    if (cores > 16) cores = 16;  /* slider/engine cap */
     char cores_txt[64];
     snprintf(cores_txt, sizeof(cores_txt), "%d Worker Cores", cores);
 
@@ -2114,7 +2178,7 @@ int main(int argc, char *argv[]) {
     GtkWidget *window = create_main_window();
     gtk_widget_show_all(window);
 
-    log_message("vWipe Turbo v2.6.0 initialized - Forensic Parallel Sanitizer Active");
+    log_message("vWipe Turbo v2.7.0 initialized - Forensic Parallel Sanitizer Active");
     log_message("Ready for secure data sanitization operations");
 
     gtk_main();

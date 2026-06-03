@@ -1,6 +1,47 @@
-# Virtual Wipe (vWipe) v2.6.0 Update Release Notes
+# Virtual Wipe (vWipe) Update Release Notes
 
-This release updates **Virtual Wipe** from version **2.5.5** to **2.6.0**. This release includes major security enhancements, robustness bug fixes, signal safety compliance, and transitions the project to a clean open-source licensing model.
+---
+
+# v2.7.0
+
+This release updates **Virtual Wipe** from version **2.6.0** to **2.7.0**. It documents the data-sanitization hardening, I/O, and verification work that landed in `vwipe.c` and `vwipe_ram.c` after the 2.6.0 notes were written, bringing the release documentation back in line with the shipped binary.
+
+## 🔐 Security & Sanitization Enhancements
+
+### 1. CSPRNG Seeding Extended to the GUI Wiper (vwipe.c)
+* In 2.6.0, cryptographically secure seeding was applied only to the RAM sanitizer (`vwipe_ram.c`). The GUI wiper now also seeds its patterns from the kernel via `get_secure_random()`/`getrandom()`:
+  * File wipe seed — `vwipe.c:682-683`
+  * Per-thread free-space base seed — `vwipe.c:903-906`
+  * Surfaced in the compliance reporting row — `vwipe.c:2097`
+
+### 2. Per-Block Unique Pattern Derivation (`splitmix64`)
+* Random data is re-derived per chunk/block so it never repeats within or across files (`vwipe.c:691`, `vwipe.c:956`).
+
+### 3. Verification Pass Support (`PASS_VERIFY`)
+* `wipe_file()` can read back and `memcmp` a pass against the previously written pattern, aborting on mismatch (`vwipe.c:695-725`).
+
+### 4. Anti-Forensic Buffer Hardening
+* Wipe buffers are now protected with `madvise(MADV_DONTDUMP)`, `secure_memzero`, and `mlock` (`vwipe.c:672-678`, `767-776`).
+
+## ⚡ I/O & Durability Changes (vwipe.c)
+
+### 5. `O_DIRECT` with Graceful Fallback + Per-Tail Toggling
+* Aligned I/O via `O_DIRECT`, with an `EINVAL` fallback and temporary disabling for unaligned file tails (`vwipe.c:640-648`, `705-719`, `731-745`).
+
+### 6. `O_SYNC` Removed From the Parallel Free-Space Writer
+* The free-space worker no longer opens temp files with `O_SYNC`; durability is instead provided by a single `fsync()` at file completion, avoiding a UI freeze on every `write()` (`vwipe.c:923-925`, `980`).
+* **Note:** `wipe_file()` intentionally still uses `O_SYNC` (`vwipe.c:640,647`).
+
+## ⚙️ RAM Module Robustness (vwipe_ram.c)
+
+### 7. Mid-Run `mlock` Degradation Handling
+* If `mlock` begins failing partway through a fill, `g_mlock_supported` is cleared and previously locked pages are unlocked during cleanup (`vwipe_ram.c:175-176`, `282`).
+
+---
+
+# v2.6.0
+
+This release updated **Virtual Wipe** from version **2.5.5** to **2.6.0**. This release includes major security enhancements, robustness bug fixes, signal safety compliance, and transitions the project to a clean open-source licensing model.
 
 ---
 

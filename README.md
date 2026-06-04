@@ -20,7 +20,7 @@ Built for security professionals, forensic investigators, and privacy-conscious 
 ## 📸 Screenshot
 
 <div align="center">
-  <img src="screenshot.png" alt="Virtual Wipe Turbo - Main Interface" width="600"/>
+  <img src="screenshot.png" alt="Virtual Wipe Turbo - Main Interface" width="700"/>
   <br/>
   <em>Forensic-grade data sanitization suite — dark-themed GTK interface with multi-core Turbo Engine</em>
 </div>

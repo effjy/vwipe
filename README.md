@@ -1,11 +1,11 @@
 # Virtual Wipe Turbo v2.7.0
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.7.0-brightgreen)]()
-[![Language](https://img.shields.io/badge/language-C-blue)]()
-[![Platform](https://img.shields.io/badge/platform-Linux-important)]()
-[![Standards](https://img.shields.io/badge/standards-NIST%20%2F%20FIPS-blue)]()
-[![Turbo Engine](https://img.shields.io/badge/engine-8--core%20Turbo-00FFCC)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-teal?style=flat-square&labelColor=1a1a1a)](LICENSE)
+[![Version](https://img.shields.io/badge/version-2.7.0-teal?style=flat-square&labelColor=1a1a1a)]()
+[![Language](https://img.shields.io/badge/language-C-teal?style=flat-square&labelColor=1a1a1a)]()
+[![Platform](https://img.shields.io/badge/platform-Linux-8a2be2?style=flat-square&labelColor=1a1a1a)]()
+[![Standards](https://img.shields.io/badge/standards-NIST%20%2F%20FIPS-teal?style=flat-square&labelColor=1a1a1a)]()
+[![Turbo Engine](https://img.shields.io/badge/engine-8--core%20Turbo-teal?style=flat-square&labelColor=1a1a1a)]()
 
 **Virtual Wipe Turbo** is a high-performance, forensic-grade secure data sanitization suite engineered for maximum speed and uncompromising security. Leveraging a multi-core "Turbo Engine," it saturates modern NVMe and SSD throughput while maintaining full compliance with rigorous international standards.
 

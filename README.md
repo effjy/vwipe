@@ -1,6 +1,7 @@
 <div align="center">
 # Virtual Wipe Turbo v2.7.0
 </div>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-teal?style=flat-square&labelColor=1a1a1a)](LICENSE)
 [![Version](https://img.shields.io/badge/version-2.7.0-teal?style=flat-square&labelColor=1a1a1a)]()
 [![Language](https://img.shields.io/badge/language-C-teal?style=flat-square&labelColor=1a1a1a)]()

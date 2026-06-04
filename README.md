@@ -1,5 +1,5 @@
 <div align="center">
-<h2>Virtual Wipe Turbo v2.7.0</h2>
+<h1>Virtual Wipe Turbo v2.7.0</h1>
 </div>
 <div align="center">
 

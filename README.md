@@ -1,5 +1,5 @@
 <div align="center">
-# <h2>Virtual Wipe Turbo v2.7.0</h2>
+<h2>Virtual Wipe Turbo v2.7.0</h2>
 </div>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-teal?style=flat-square&labelColor=1a1a1a)](LICENSE)

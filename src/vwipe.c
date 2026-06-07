@@ -299,6 +299,7 @@ int check_for_stop_interrupt(void);
 void update_progress(const char *label);
 void startup_compliance_check(void);
 void launch_ram_fill(unsigned long safety_mb);
+static pid_t read_ram_fill_pidfile(void);
 int wipe_file(const char *path, const WipeScheme *scheme);
 int wipe_directory_recursive(const char *path, const WipeScheme *scheme);
 int wipe_free_space(const char *path, int num_cores, const WipeScheme *scheme);
@@ -460,22 +461,66 @@ gboolean idle_reset_ui(gpointer user_data G_GNUC_UNUSED) {
     return G_SOURCE_REMOVE;
 }
 
-/* Callback for child process termination */
-void on_ram_fill_child_exited(GPid pid, gint status, gpointer user_data G_GNUC_UNUSED) {
-    if (WIFEXITED(status)) {
-        if (WEXITSTATUS(status) == 0) {
-            log_message("[+] RAM fill completed successfully!");
-            log_message("[+] Memory has been allocated and released automatically");
-        } else {
-            log_message("[!] RAM fill process terminated with error");
-        }
-    } else if (WIFSIGNALED(status)) {
-        log_message("[!] RAM fill process was terminated by signal");
-    }
-    
-    if (g_ram_fill_pid == pid) g_ram_fill_pid = 0;
+/* Callback for spawned terminal termination.
+ *
+ * NOTE: the watched PID is the terminal emulator, NOT vwipe_ram. For
+ * daemon-backed terminals (gnome-terminal, mate-terminal, xfce4-terminal) this
+ * client process exits almost immediately — often with a non-zero status — while
+ * the real RAM fill runs under the terminal server. So its exit status says
+ * nothing about whether the fill succeeded. We only reap it here to avoid a
+ * zombie; the actual success/failure + UI reset is driven by poll_ram_fill_status()
+ * watching the worker PID that vwipe_ram publishes via its pidfile. */
+void on_ram_fill_child_exited(GPid pid, gint status G_GNUC_UNUSED, gpointer user_data G_GNUC_UNUSED) {
     g_spawn_close_pid(pid);
+}
+
+/* State for polling the real vwipe_ram worker via its pidfile. */
+typedef struct {
+    GPid  term_pid;     /* spawned terminal pid (for clearing g_ram_fill_pid) */
+    pid_t worker_pid;   /* vwipe_ram pid from pidfile; 0 until first seen */
+    int   wait_ticks;   /* ticks spent waiting for the pidfile to appear */
+} RamFillWatch;
+
+/* Polls (~500ms) the pidfile vwipe_ram writes so success/failure tracks the real
+ * worker rather than the terminal emulator. */
+static gboolean poll_ram_fill_status(gpointer data) {
+    RamFillWatch *w = (RamFillWatch *)data;
+
+    /* Phase 1: wait for vwipe_ram to publish its pid. */
+    if (w->worker_pid == 0) {
+        pid_t rpid = read_ram_fill_pidfile();
+        if (rpid > 0) {
+            w->worker_pid = rpid;
+        } else if (++w->wait_ticks > 120) {  /* ~60s with no pidfile */
+            log_message("[!] RAM fill worker did not start (no pidfile detected)");
+            if (g_ram_fill_pid == w->term_pid) g_ram_fill_pid = 0;
+            free(w);
+            g_idle_add(idle_reset_ui, NULL);
+            return G_SOURCE_REMOVE;
+        }
+        return G_SOURCE_CONTINUE;
+    }
+
+    /* Phase 2: worker known — is it still alive? */
+    if (kill(w->worker_pid, 0) == 0 || errno == EPERM) {
+        return G_SOURCE_CONTINUE;  /* still running */
+    }
+
+    /* Worker is gone. vwipe_ram removes its pidfile via atexit() on a clean exit,
+     * so a still-present pidfile naming this pid means it died abnormally. */
+    if (read_ram_fill_pidfile() == w->worker_pid) {
+        log_message("[!] RAM fill process terminated unexpectedly");
+    } else if (atomic_load(&g_stop_flag)) {
+        log_message("[+] RAM fill stopped by user; memory released and cleared");
+    } else {
+        log_message("[+] RAM fill completed successfully!");
+        log_message("[+] Memory has been allocated and released automatically");
+    }
+
+    if (g_ram_fill_pid == w->term_pid) g_ram_fill_pid = 0;
+    free(w);
     g_idle_add(idle_reset_ui, NULL);
+    return G_SOURCE_REMOVE;
 }
 
 /* Update progress display with throttling */
@@ -579,8 +624,20 @@ void launch_ram_fill(unsigned long safety_mb) {
                 log_message(log_msg);
                 log_message("Monitoring RAM fill process...");
                 
-                /* Watch the child process without blocking the main loop */
+                /* Reap the terminal client (avoids a zombie); its exit status is
+                 * not meaningful for the fill result, so don't act on it. */
                 g_child_watch_add(pid, on_ram_fill_child_exited, NULL);
+
+                /* Track the real worker via its pidfile for accurate status. */
+                RamFillWatch *watch = calloc(1, sizeof(RamFillWatch));
+                if (watch) {
+                    watch->term_pid = pid;
+                    g_timeout_add(500, poll_ram_fill_status, watch);
+                } else {
+                    /* Out of memory for the watcher: fall back to resetting the
+                     * UI when the terminal client exits so it doesn't hang. */
+                    g_idle_add(idle_reset_ui, NULL);
+                }
                 return;
             }
             g_strfreev(argv);
@@ -1303,6 +1360,7 @@ void on_free_space_wipe_clicked(GtkButton *button G_GNUC_UNUSED, gpointer user_d
 void on_ram_fill_clicked(GtkButton *button G_GNUC_UNUSED, gpointer user_data G_GNUC_UNUSED) {
     if (g_operation_running) return;
     unsigned long safety_mb = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(ram_fill_spinbutton));
+    atomic_store(&g_stop_flag, false);
     g_operation_running = true;
     set_ui_sensitive(FALSE);
     log_message("Launching RAM fill in terminal window...");

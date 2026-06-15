@@ -1,10 +1,10 @@
 <div align="center">
-<h1>Virtual Wipe Turbo v2.7.0</h1>
+<h1>Virtual Wipe Turbo v2.8.0</h1>
 </div>
 <div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-teal?style=flat-square&labelColor=1a1a1a)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.7.0-teal?style=flat-square&labelColor=1a1a1a)]()
+[![Version](https://img.shields.io/badge/version-2.8.0-teal?style=flat-square&labelColor=1a1a1a)]()
 [![Language](https://img.shields.io/badge/language-C-teal?style=flat-square&labelColor=1a1a1a)]()
 [![Platform](https://img.shields.io/badge/platform-Linux-8a2be2?style=flat-square&labelColor=1a1a1a)]()
 [![Standards](https://img.shields.io/badge/standards-NIST%20%2F%20FIPS-teal?style=flat-square&labelColor=1a1a1a)]()
@@ -93,19 +93,24 @@ This installs the `vwipe` binary to `/usr/local/bin` and registers the desktop e
 
 ## ⚖️ Forensic Considerations
 
-On Copy-on-Write filesystems (Btrfs, ZFS, APFS), traditional file-level wiping can be ineffective due to snapshotting and delayed allocation. In such cases, **Free Space Wipe** is strongly recommended to ensure complete data destruction.
+**Read this before relying on vWipe for irreversible data destruction.**
+
+- **SSDs / NVMe / flash storage.** Software overwriting cannot guarantee erasure on flash. Wear-leveling and **over-provisioning** mean the controller may write your "overwrite" to a *different* physical cell, leaving the original data in NAND that is not addressable from software — repeating a free-space wipe does **not** reach it. vWipe now **detects SSD/NVMe devices and warns you** in the log. For guaranteed sanitization on flash, use the drive's **hardware Secure Erase** (`nvme sanitize`, `hdparm --security-erase`) or **crypto-erase** (full-disk encryption from day one, then destroy the key — what NIST SP 800-88 calls *Purge* for flash).
+- **Journaling / Copy-on-Write filesystems** (ext4, XFS, Btrfs, ZFS, APFS). File contents and metadata can persist in the journal or in snapshots regardless of overwrite passes. vWipe detects these and warns; **Free Space Wipe** helps but carries the same flash caveat above.
+- **TRIM.** After deletion vWipe issues a filesystem-wide `FITRIM` (and `BLKSECDISCARD` on raw block-device targets) so the controller can release wiped blocks. TRIM requires privileges and filesystem/device support; it is advisory and does not by itself guarantee physical erasure.
+
+In short: vWipe is excellent for log/file hygiene and for HDDs, where a single overwrite pass is sufficient. On SSDs, treat it as best-effort and pair it with hardware Secure Erase or crypto-erase for certainty.
 
 ---
 
-## 🔄 v2.7.0 Release Highlights
+## 🔄 v2.8.0 Release Highlights
 
-Version 2.7.0 brings significant stability, security, and correctness improvements:
+Version 2.8.0 focuses on **correctness and honesty** of the SSD/TRIM path:
 
-- Enhanced directory metadata purging with parent `fsync()` to guarantee removal of file entries
-- Fixed TRIM sequencing to ensure proper SSD wear-leveling cooperation
-- Improved thread safety with atomic progress counters and isolated scheme parameters
-- Hardened RAM module with corrected `mlock` capability checks and cryptographically seeded passes
-- Resolved multiple data race conditions and async-signal safety issues
+- **Fixed TRIM — it actually runs now.** The previous `attempt_trim()` called `BLKDISCARD` with a zero-length range on a regular-file descriptor, which was a no-op. It now issues a filesystem-wide `FITRIM` after `unlink()` for files/directories, and `BLKSECDISCARD`/`BLKDISCARD` over the full device for raw block-device targets.
+- **Honest storage advisory.** Re-introduced SSD/NVMe and journaling/CoW filesystem detection: the log now warns when software overwrite cannot guarantee erasure and points to hardware Secure Erase / crypto-erase.
+- **Free-space safety margin.** Free Space Wipe now leaves a 256 MB `SAFE_ZONE` so it can no longer fill the filesystem to 100% and starve a running system with `ENOSPC`.
+- Documentation corrected to stop over-promising on flash media.
 
 For the complete changelog, see [UPDATE.md](UPDATE.md).
 

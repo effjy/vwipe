@@ -29,13 +29,14 @@
 #include <signal.h>
 #include <stdint.h>
 #include <sys/sysinfo.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 
 /* Configuration constants */
-#define SAFE_ZONE_BYTES (0ULL)
+#define SAFE_ZONE_BYTES (256ULL * 1024 * 1024) /* keep 256MB free so a free-space wipe can't wedge a running system */
 #define BUFFER_SIZE (4ULL * 1024 * 1024)
 #define PROGRESS_UPDATE_INTERVAL (4ULL * 1024 * 1024)
 #define DEFAULT_SAFETY_MB 250
@@ -356,6 +357,7 @@ void secure_memzero(void *ptr, size_t len);
 int get_secure_random(void *buf, size_t len);
 void fill_buffer(unsigned char *buf, size_t len, int type, uint64_t seed);
 void attempt_trim(const char *path);
+void storage_advisory(const char *path);
 void restore_terminal(void);
 int check_for_stop_interrupt(void);
 void update_progress(const char *label);
@@ -449,16 +451,95 @@ void fill_buffer(unsigned char *buf, size_t len, int type, uint64_t seed) {
     }
 }
 
-/* Attempt TRIM operation */
+/* Attempt TRIM / block discard.
+ *
+ * Older versions called BLKDISCARD with a {0,0} range on a regular-file fd,
+ * which is a no-op twice over: BLKDISCARD only works on a block-device node,
+ * and a zero-length range discards nothing. This version dispatches correctly:
+ *   - block device  -> BLKSECDISCARD (fallback BLKDISCARD) over the whole device
+ *   - file/dir       -> filesystem-wide FITRIM on the containing filesystem,
+ *                       so blocks freed by the preceding unlink are discarded.
+ * FITRIM and BLK*DISCARD require CAP_SYS_ADMIN; failures are ignored and we
+ * always fall back to sync(). For files this must be called AFTER unlink(),
+ * since FITRIM only reclaims already-free space. */
 void attempt_trim(const char *path) {
-#ifdef __linux__
+#if defined(__linux__) && defined(FITRIM)
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISBLK(st.st_mode)) {
+        int bfd = open(path, O_WRONLY | O_CLOEXEC);
+        if (bfd >= 0) {
+            uint64_t sz = 0;
+            if (ioctl(bfd, BLKGETSIZE64, &sz) == 0 && sz > 0) {
+                uint64_t range[2] = {0, sz};
+                if (ioctl(bfd, BLKSECDISCARD, range) != 0)
+                    ioctl(bfd, BLKDISCARD, range);
+            }
+            close(bfd);
+        }
+        sync();
+        return;
+    }
+
+    /* Regular file or directory: TRIM the whole containing filesystem. */
     int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        /* path may already be unlinked; fall back to its parent directory. */
+        char tmp[4096];
+        snprintf(tmp, sizeof(tmp), "%s", path);
+        char *slash = strrchr(tmp, '/');
+        if (slash) {
+            *slash = '\0';
+            fd = open(tmp[0] ? tmp : "/", O_RDONLY | O_CLOEXEC);
+        } else {
+            fd = open(".", O_RDONLY | O_CLOEXEC);
+        }
+    }
     if (fd >= 0) {
-        uint64_t range[2] = {0, 0};
-        ioctl(fd, BLKDISCARD, &range);
+        struct fstrim_range range = { .start = 0, .len = ~0ULL, .minlen = 0 };
+        ioctl(fd, FITRIM, &range); /* no-op if unsupported or unprivileged */
         close(fd);
     }
+#else
+    (void)path;
 #endif
+    sync();
+}
+
+/* Storage advisory: warn when software overwrite cannot guarantee erasure.
+ * Re-introduces the honest SSD / journaling-FS detection that earlier
+ * standalone versions had, so the GUI does not over-promise on flash. */
+void storage_advisory(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        char sys_path[256];
+        snprintf(sys_path, sizeof(sys_path),
+                 "/sys/dev/block/%u:%u/queue/rotational",
+                 major(st.st_dev), minor(st.st_dev));
+        FILE *f = fopen(sys_path, "r");
+        if (f) {
+            int rot = 1;
+            if (fscanf(f, "%d", &rot) == 1 && rot == 0) {
+                log_message("[!] SSD/NVMe detected: wear-leveling and over-provisioning mean software overwrite cannot reach all physical NAND cells.");
+                log_message("[i] For guaranteed sanitization use the drive's hardware Secure Erase (nvme sanitize / hdparm --security-erase) or crypto-erase (destroy the LUKS/SED key).");
+            }
+            fclose(f);
+        }
+    }
+
+    struct statfs sfs;
+    if (statfs(path, &sfs) == 0) {
+        switch ((uint64_t)sfs.f_type) {
+            case 0xEF53ULL:      /* ext2/3/4 */
+            case 0x58465342ULL:  /* XFS      */
+            case 0x9123683EULL:  /* Btrfs    */
+            case 0x2FC12FC1ULL:  /* ZFS      */
+            case 0xF2F52010ULL:  /* F2FS     */
+                log_message("[!] Journaling/CoW filesystem detected: residual data may persist in the journal or snapshots regardless of overwrite passes.");
+                break;
+            default:
+                break;
+        }
+    }
 }
 
 /* Restore terminal settings */
@@ -747,6 +828,8 @@ int wipe_file(const char *path, const WipeScheme *scheme) {
         return 0;
     }
 
+    storage_advisory(path);
+
     size_t file_size = (size_t)st.st_size;
     atomic_store(&g_target_bytes, file_size * scheme->pass_count);
     atomic_store(&g_bytes_written, 0);
@@ -905,12 +988,12 @@ cleanup:
             if (rename(path, new_name) == 0) {
                 int dfd = open(dir, O_RDONLY);
                 if (dfd >= 0) { fsync(dfd); close(dfd); }
-                attempt_trim(new_name);
                 unlink(new_name);
             } else {
-                attempt_trim(path);
                 unlink(path);
             }
+            /* TRIM after unlink so the just-freed blocks are reclaimable. */
+            attempt_trim(dir);
             free(dir);
         }
         snprintf(msg, sizeof(msg), "File securely sanitized & removed: %s", path);
@@ -1124,10 +1207,15 @@ int wipe_free_space(const char *path, int num_cores, const WipeScheme *scheme) {
         return -1;
     }
     uint64_t avail = (uint64_t)st.f_bavail * (uint64_t)st.f_bsize;
-    if (avail == 0) {
-        log_message("Error: No space available.");
+    if (avail <= SAFE_ZONE_BYTES) {
+        log_message("Error: Not enough free space above the safety margin. Aborting.");
         return -1;
     }
+    /* Leave a safety margin so we never fill the filesystem to 100% and starve
+       other processes (ENOSPC) on a live system. */
+    avail -= SAFE_ZONE_BYTES;
+
+    storage_advisory(path);
 
     atomic_store(&g_target_bytes, (size_t)avail * scheme->pass_count);
     atomic_store(&g_bytes_written, 0); 
@@ -1307,9 +1395,10 @@ void *thread_wipe_dir(void *data) {
         utimensat(AT_FDCWD, td->path, times, AT_SYMLINK_NOFOLLOW);
         rmdir(td->path);
     }
+    /* TRIM the parent filesystem after the directory has been removed. */
+    attempt_trim(parent);
     free(parent);
-    attempt_trim(td->path);
-    
+
     free(td->path);
     free(td);
     g_idle_add(idle_reset_ui, NULL);
@@ -1518,7 +1607,7 @@ void on_menu_about_activate(GtkMenuItem *menuitem G_GNUC_UNUSED, gpointer user_d
     gtk_box_pack_start(GTK_BOX(main_vbox), name_label, FALSE, FALSE, 0);
     
     GtkWidget *ver_label = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(ver_label), "<span color='#8ea2ba'>Version 2.7.0 \xe2\x80\xa2 Multi-Threaded Forensic-Grade Sanitization</span>");
+    gtk_label_set_markup(GTK_LABEL(ver_label), "<span color='#8ea2ba'>Version 2.8.0 \xe2\x80\xa2 Multi-Threaded Forensic-Grade Sanitization</span>");
     gtk_box_pack_start(GTK_BOX(main_vbox), ver_label, FALSE, FALSE, 5);
     
     GtkWidget *sep_top = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
@@ -1549,9 +1638,11 @@ void on_menu_about_activate(GtkMenuItem *menuitem G_GNUC_UNUSED, gpointer user_d
         "Sensitive buffers are locked into physical memory to prevent "
         "wiping data from being leaked to swap partitions or hibernation files.", "\xf0\x9f\x94\x92"); /* Lock */
 
-    add_feature_row(feature_box, "TRIM &amp; Secure Discard", 
-        "Automatically issues BLKDISCARD and TRIM commands to ensure "
-        "NAND Flash controllers fully release the wiped blocks.", "\xf0\x9f\x97\x91\xef\xb8\x8f"); /* Trash */
+    add_feature_row(feature_box, "TRIM &amp; Secure Discard",
+        "Issues filesystem-wide FITRIM after deletion (and BLKSECDISCARD on raw "
+        "block devices) so SSD controllers release wiped blocks. Note: on SSDs, "
+        "over-provisioned cells may still retain data \xe2\x80\x94 use hardware "
+        "Secure Erase or crypto-erase for guaranteed sanitization.", "\xf0\x9f\x97\x91\xef\xb8\x8f"); /* Trash */
 
     gtk_widget_show_all(dialog);
     gtk_dialog_run(GTK_DIALOG(dialog));
@@ -2298,7 +2389,7 @@ int main(int argc, char *argv[]) {
     GtkWidget *window = create_main_window();
     gtk_widget_show_all(window);
 
-    log_message("vWipe Turbo v2.7.0 initialized - Forensic Parallel Sanitizer Active");
+    log_message("vWipe Turbo v2.8.0 initialized - Forensic Parallel Sanitizer Active");
     log_message("Ready for secure data sanitization operations");
 
     gtk_main();

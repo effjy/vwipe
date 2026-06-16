@@ -1,5 +1,5 @@
 <div align="center">
-<h1><a href="https://github.com/effjy/vwipe/"><img src="titles/virtual-wipe-turbo-v280-title.svg" height="44" alt="Virtual Wipe Turbo v2.8.0"></a></h1>
+<h1><a href="https://github.com/effjy/vwipe/"><img src="titles/virtual-wipe-turbo-v280-title.svg" height="52" alt="Virtual Wipe Turbo v2.8.0"></a></h1>
 </div>
 <div align="center">
 
